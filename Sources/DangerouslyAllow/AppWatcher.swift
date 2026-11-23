@@ -74,7 +74,7 @@ final class AppWatcher {
         if let channel = opts.nativeGuiChannel {
             Log.info("native channel: \(channel.rawValue) — \(opts.gate?.summary ?? "observe-only")")
         }
-        if opts.cardLedger != nil {
+        if opts.cardLedger != nil, opts.nativeGuiChannel == nil {
             Log.info("card press ledger: one press per card identity for "
                 + "\(Int(CardPressGuard.defaultRetention / 3600))h")
         }

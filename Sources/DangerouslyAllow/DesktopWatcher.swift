@@ -111,6 +111,10 @@ final class DesktopWatcher {
         Log.info("  cards in: " + (opts.apps.isEmpty
             ? "none — name an approved app with --app plus --approve-cards"
             : opts.apps.joined(separator: ", ")))
+        if opts.cardLedger != nil, !opts.apps.isEmpty {
+            Log.info("  card press ledger: one press per card identity for "
+                + "\(Int(CardPressGuard.defaultRetention / 3600))h")
+        }
         Log.info("  policy: cards \(opts.policies.card.rawValue), "
             + "system dialogs \(opts.policies.dialog.rawValue)")
         if !opts.neverApprove.isEmpty {
