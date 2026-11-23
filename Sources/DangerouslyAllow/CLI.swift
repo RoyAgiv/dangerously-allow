@@ -2,34 +2,70 @@ import DangerouslyAllowCore
 import Foundation
 
 private let usage = """
-dangerously-allow — auto-approve the permission prompts the Claude and ChatGPT
-desktop apps put in your way, on macOS
+dangerously-allow — contained, observe-only-by-default approval for the
+permission prompts the ChatGPT and T3 desktop apps put in your way, on macOS
 
 USAGE
-  dangerously-allow [options]                     watch the whole desktop
+  dangerously-allow [options]                     observe the whole desktop
 
-  With no arguments it answers all of it, in one process: the approval cards
-  inside the ChatGPT and Claude desktop apps, Allow-style actions on
+  With no arguments it observes all of it, in one process: the approval cards
+  inside the ChatGPT and T3 desktop apps, Allow-style actions on
   notification banners, and the native macOS permission dialogs they trigger on
   the way to controlling your machine ("ChatGPT wants access to control X").
-  Anything shaped like a prompt with a button that grants is answered, whatever
-  its wording; several at once are answered in one sweep, and a sweep that
-  pressed something looks again immediately instead of sleeping the poll
-  interval. Needs this terminal to have Accessibility permission (System
-  Settings → Privacy & Security → Accessibility). No sudo.
+
+  The whole-desktop default is observe-only: it logs what it sees and presses
+  nothing. Native permission dialogs are never pressed unless every
+  containment gate passes (see CONTAINMENT); in-app cards are pressed only for
+  an approved app you name explicitly with --app plus --approve-cards.
 
 OPTIONS
   --policy once|session|always   which grant to click  (default: session for
-                                 cards, always for system dialogs — see POLICY)
-  --app <name>                   also answer cards in this app  (repeatable;
-                                 a localized name or a bundle id)
-  --never-approve <regex>        refuse if the prompt matches   (repeatable)
+                                 cards, once for system dialogs — see POLICY)
+  --app <name>                   answer cards in this approved app  (repeatable;
+                                 requires --approve-cards; only ChatGPT
+                                 (com.openai.codex) and T3 (com.t3tools.t3code)
+                                 are pinned)
+  --approve-cards                opt in to pressing in-app cards, for the apps
+                                 named with --app and verified by code signature
+  --never-approve <regex>        refuse if the prompt matches   (repeatable;
+                                 required before a native dialog may be pressed)
   --dry-run                      log the plan, press nothing
   --verbose                      print every option and the tier it was given
   --once                         exit after the first approval
   --poll <ms>                    scan interval                  (default: 500)
   --require-trigger              only answer prompts whose wording is recognised
+                                 (native dialogs always require this)
   --notify                       macOS notification when left for a human
+
+CONTAINMENT (native permission dialogs and notification banners)
+  The native-GUI channel is observe-only by default and in the bare invocation.
+  A press needs all of: recognised wording, at least one --never-approve
+  pattern, --policy once, a window owned by a pinned app whose code signature
+  satisfies its designated requirement, and a one-use capability signed by a
+  trusted issuer. There is no flag that skips a gate.
+
+  --native-gui-capability <file>  a signed, short-lived, single-use capability
+  --trusted-issuer <sha256>       SHA-256 of an issuer's SPKI DER  (repeatable;
+                                  empty = nothing is trusted)
+  --task-id <id>                  task the capability must be bound to
+  --session-id <id>               optional correlator the capability must match
+  --host <name>                   host the capability must be bound to
+                                  (default: this machine's host name)
+  --replay-store <dir>            one-use nonce ledger directory
+  --containment-status            print the resolved containment configuration
+                                  as JSON and exit; presses nothing
+  --containment-check             evaluate a capability against an installed
+                                  app and print the decision as JSON; consumes
+                                  the capability's nonce on success, presses
+                                  nothing
+  --check-app <name|path>         app the check verifies (default: ChatGPT)
+  --channel <name>                system-dialog|notification-banner
+  --prompt-fingerprint <id>       prompt the check pretends to answer
+  --target-label <label>          button the check pretends to press
+
+  Task ids and session ids are correlators, never credentials: the signature,
+  the pinned issuer fingerprint, the expiry and the one-use nonce are what
+  authorise a press.
 
 ONE CHANNEL AT A TIME
   dangerously-allow gui [options]                 native macOS permission dialogs
@@ -83,32 +119,29 @@ OPTIONS (app + notifications)
   --poll / --require-trigger     as above
   --dump                         print the app's pruned AX tree once and exit
 
-  `app <name>` matches a running app by name or bundle id and presses the
-  option the policy allows on approval cards it shows — e.g. the ChatGPT
-  desktop app's "Allow once / Always allow / Deny". `notifications` does the
-  same for action buttons on macOS notification banners. Both need this
-  terminal to have Accessibility permission (System Settings → Privacy &
-  Security → Accessibility) — no sudo. A card only counts when it offers both
-  a grant and a refusal, like the TUI path.
+  `app <name>` matches a running approved app by name or bundle id and presses
+  the option the policy allows on approval cards it shows — e.g. the ChatGPT
+  desktop app's "Allow once / Always allow / Deny". Only two identities are
+  pinned: ChatGPT (com.openai.codex, team 2DC432GLL2) and T3
+  (com.t3tools.t3code, team ARK85ZXQ4Z); the running app's code signature is
+  checked against its designated requirement, and any other app is rejected.
+  `notifications` does the same for action buttons on macOS notification
+  banners, but banners are observe-only: the poster cannot be attested, so the
+  containment gate always declines. Both need this terminal to have
+  Accessibility permission (System Settings → Privacy & Security →
+  Accessibility) — no sudo. A card only counts when it offers both a grant and
+  a refusal, like the TUI path.
 
 OPTIONS (gui)
   --policy / --never-approve / --dry-run / --verbose / --dump / --notify /
-  --once / --poll / --require-trigger  as above  (--policy default: always)
+  --once / --poll / --require-trigger + CONTAINMENT  (--policy default: once)
 
-  A native permission dialog is answered into the TCC database, so its grant
-  outlives the process: a plain "Allow" is a *permanent* grant however mildly
-  it is worded. gui defaults to --policy always and presses it, because a TCC
-  dialog almost never offers a session- or once-scoped button — a session
-  default would leave the common dialogs untouched. Refusals and neutral
-  buttons ("Open System Settings") are never pressed under any policy; pass
-  --policy session to press only an explicit "Allow Once". Unlike a card, a
-  system dialog need not offer a refusal — macOS 15's screen-capture prompt
-  offers "Allow" and "Open System Settings", and the way out is Esc — so what
-  gates it is the shape (a handful of buttons), a button that grants, and the
-  policy ceiling. Recognised wording is not required: a keyword list only knows
-  the prompts someone has already transcribed, and Chrome's "Allow remote
-  debugging?" is nobody's TCC sentence. --require-trigger demands it anyway.
-  Run --verbose to see the dialogs it passed over and why.
+  gui scans every app for a native permission dialog. It observes and never
+  presses unless the containment gates pass, and even then only an explicitly
+  one-shot button ("Allow Once") is eligible: a plain "Allow" is a permanent
+  TCC grant however mildly it is worded, so this executable never presses one.
+  Refusals and neutral buttons ("Open System Settings") are never pressed under
+  any policy. Run --verbose to see the dialogs it passed over and why.
 
 POLICY
   once     click "Yes" / "Allow once"
@@ -122,16 +155,17 @@ POLICY
   means different things in each. "Allow once" on an in-app card really is
   one-shot, so cards default to session. "Allow" on a system dialog is written
   to the TCC database and outlives the process — it is a permanent grant however
-  mildly it is worded — so system dialogs are pressed only under always, which
-  is their default because they almost never offer anything narrower. Passing
-  --policy sets both: --policy session stops answering system dialogs
-  altogether unless one offers an explicit "Allow Once".
+  mildly it is worded — so the native-GUI channel defaults to once and the
+  containment gate refuses anything broader. Passing --policy sets both, but a
+  native dialog still needs a valid capability before anything is pressed.
 
 EXAMPLES
-  dangerously-allow                               # the usual: watch everything
+  dangerously-allow                               # observe the desktop
   dangerously-allow --dry-run --verbose           # see what it would press
   dangerously-allow --never-approve 'rm -rf' --never-approve 'Full Disk Access'
-  dangerously-allow --app Cursor                  # answer another app's cards too
+  dangerously-allow --app ChatGPT --approve-cards  # answer ChatGPT's cards
+  dangerously-allow app com.t3tools.t3code        # answer T3's cards
+  dangerously-allow gui --containment-status      # what containment resolved
   dangerously-allow app ChatGPT --dump            # print one app's AX tree
   dangerously-allow run claude                    # secondary: a TUI agent in tmux
 """
@@ -142,7 +176,10 @@ struct CLI {
         var args = Array(CommandLine.arguments.dropFirst())
         // No arguments is the point of the tool: start watching everything.
         guard let subcommand = args.first else {
-            runDesktop([])
+            // The zero-argument invocation is the safe default by construction:
+            // it observes, and a capability in the environment does not change
+            // that. Opting into a click-capable run needs an explicit channel.
+            runDesktop([], bare: true)
             return
         }
 
@@ -150,7 +187,7 @@ struct CLI {
         case "-h", "--help", "help":
             Log.plain(usage)
         case "-v", "--version":
-            Log.plain("dangerously-allow 0.3.0")
+            Log.plain("dangerously-allow 0.4.0")
         case "gui":
             args.removeFirst()
             runGui(args)
@@ -180,11 +217,21 @@ struct CLI {
 
     // MARK: - desktop (the default)
 
-    private static func runDesktop(_ args: [String]) {
+    private static func runDesktop(_ args: [String], bare: Bool = false) {
         var opts = DesktopOptions()
+        var containment = ContainmentOptions.fromEnvironment()
+        if bare {
+            containment.forceObserveOnly = true
+        }
         var extraApps: [String] = []
+        var approveCards = false
         var i = 0
+        func value() -> String { take(args, &i, args[i]) }
         while i < args.count {
+            if containment.handle(args[i], value: value) {
+                i += 1
+                continue
+            }
             switch args[i] {
             case "--policy":
                 // One flag, both channels — see POLICY in the usage text for
@@ -192,6 +239,7 @@ struct CLI {
                 let policy = parsePolicy(take(args, &i, "--policy"))
                 opts.policies = DesktopPolicies(dialog: policy, card: policy)
             case "--app": extraApps.append(take(args, &i, "--app"))
+            case "--approve-cards": approveCards = true
             case "--dry-run": opts.dryRun = true
             case "--once": opts.stopAfterFirst = true
             case "--verbose", "-v": opts.verbose = true
@@ -207,7 +255,20 @@ struct CLI {
             }
             i += 1
         }
-        opts.apps += extraApps
+        // Cards are pressed only for an app the operator named *and* opted into
+        // with --approve-cards; a bare invocation names nothing, so it presses
+        // nothing anywhere.
+        opts.apps = approveCards ? extraApps : []
+
+        containment.policy = opts.policies.dialog
+        containment.neverApprove = opts.neverApprove
+        if containment.printStatus {
+            containment.printStatusJSON(channel: .systemDialog)
+        }
+        if containment.runCheck {
+            containment.printCheckJSON(channel: containment.checkChannel)
+        }
+        opts.gate = containment.makeGate(channel: .systemDialog)
 
         signal(SIGINT) { _ in
             Log.plain("")
@@ -286,8 +347,14 @@ struct CLI {
 
     private static func runGui(_ args: [String]) {
         var opts = GuiWatchOptions()
+        var containment = ContainmentOptions.fromEnvironment()
         var i = 0
+        func value() -> String { take(args, &i, args[i]) }
         while i < args.count {
+            if containment.handle(args[i], value: value) {
+                i += 1
+                continue
+            }
             switch args[i] {
             case "--policy": opts.policy = parsePolicy(take(args, &i, "--policy"))
             case "--dry-run": opts.dryRun = true
@@ -306,6 +373,16 @@ struct CLI {
             }
             i += 1
         }
+
+        containment.policy = opts.policy
+        containment.neverApprove = opts.neverApprove
+        if containment.printStatus {
+            containment.printStatusJSON(channel: .systemDialog)
+        }
+        if containment.runCheck {
+            containment.printCheckJSON(channel: containment.checkChannel)
+        }
+        opts.gate = containment.makeGate(channel: .systemDialog)
 
         signal(SIGINT) { _ in
             Log.plain("")
@@ -323,19 +400,41 @@ struct CLI {
             Log.error("app requires an app name or bundle id, e.g. `dangerously-allow app ChatGPT`")
             exit(2)
         }
-        watchApp(AppWatchOptions(appName: name), Array(args.dropFirst()))
+        guard let pinned = NativeGuiContainment.approvedApp(named: name) else {
+            Log.error("'\(name)' is not an approved app — refusing to answer its cards")
+            Log.error("  approved: " + NativeGuiContainment.approvedApps
+                .map { "\($0.displayName) (\($0.bundleID), team \($0.teamID))" }
+                .joined(separator: "; "))
+            exit(2)
+        }
+        var base = AppWatchOptions(appName: pinned.bundleID)
+        base.pinnedApp = pinned
+        watchApp(base, Array(args.dropFirst()), containment: nil)
     }
 
     private static func runNotifications(_ args: [String]) {
         // Notification banners live in Notification Center's process, and their
         // buttons are AX actions on the banner element — AppWatcher knows how.
-        watchApp(AppWatchOptions(appName: "com.apple.notificationcenterui"), args)
+        // The poster cannot be attested from the banner, so this channel is
+        // observe-only: the containment gate always declines to press.
+        var base = AppWatchOptions(appName: "com.apple.notificationcenterui")
+        base.nativeGuiChannel = .notificationBanner
+        watchApp(base, args, containment: ContainmentOptions.fromEnvironment())
     }
 
-    private static func watchApp(_ base: AppWatchOptions, _ args: [String]) {
+    private static func watchApp(
+        _ base: AppWatchOptions, _ args: [String], containment: ContainmentOptions?
+    ) {
         var opts = base
+        var containment = containment
         var i = 0
+        func value() -> String { take(args, &i, args[i]) }
         while i < args.count {
+            if var current = containment, current.handle(args[i], value: value) {
+                containment = current
+                i += 1
+                continue
+            }
             switch args[i] {
             case "--policy": opts.policy = parsePolicy(take(args, &i, "--policy"))
             case "--dry-run": opts.dryRun = true
@@ -353,6 +452,20 @@ struct CLI {
                 exit(2)
             }
             i += 1
+        }
+
+        if var resolved = containment {
+            resolved.policy = opts.policy
+            resolved.neverApprove = opts.neverApprove
+            if resolved.printStatus {
+                resolved.printStatusJSON(channel: opts.nativeGuiChannel ?? .systemDialog)
+            }
+            if resolved.runCheck {
+                resolved.printCheckJSON(channel: resolved.checkChannel)
+            }
+            if let channel = opts.nativeGuiChannel {
+                opts.gate = resolved.makeGate(channel: channel)
+            }
         }
 
         signal(SIGINT) { _ in

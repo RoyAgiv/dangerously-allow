@@ -55,8 +55,14 @@ final class DesktopRouterTests: XCTestCase {
         guard case let .systemDialog(d) = DesktopRouter.route(
             window: automationDialog(), cardsAllowed: true, policies: DesktopPolicies()
         ) else { return XCTFail("a TCC dialog must never be routed as a card") }
-        XCTAssertEqual(d.target?.label, "Allow")
-        XCTAssertEqual(d.target?.kind, .allowAlways, "a TCC grant is permanent")
+        // The default native tier is one-shot, so a plain "Allow" is detected
+        // as a permanent grant and left for the containment gate — which
+        // declines unless it holds a capability. It is never a card.
+        XCTAssertNil(d.target)
+        XCTAssertEqual(
+            d.options.first { $0.label == "Allow" }?.kind, .allowAlways,
+            "a TCC grant is permanent however mildly it is worded"
+        )
     }
 
     /// Proves the ordering is load-bearing rather than incidental: the card
@@ -91,18 +97,26 @@ final class DesktopRouterTests: XCTestCase {
     }
 
     /// Outside the watched apps there is no card path, so a window this small
-    /// with a button that grants falls to the lenient dialog tier and is
-    /// answered — the point of "if it is a prompt, allow it". What keeps this
-    /// off a web page's Allow/Deny is the shape gate below, not an app list.
-    func testDialogShapedWindowInAnUnwatchedAppIsAnswered() {
+    /// with a button that grants falls to the lenient dialog tier. Under the
+    /// one-shot default its plain "Allow" has no acceptable target; the window
+    /// is still owned by containment, not by the card channel.
+    func testDialogShapedWindowInAnUnwatchedAppIsRoutedToContainment() {
         guard case let .systemDialog(d) = DesktopRouter.route(
             window: browserUseCard(), cardsAllowed: false, policies: DesktopPolicies()
         ) else { return XCTFail("a small window offering a grant is a prompt") }
-        XCTAssertNotNil(d.target)
+        XCTAssertEqual(d.target?.label, "Allow once",
+                       "only the explicit one-shot button is eligible")
+        // Only a permanently-granting policy even offers it as a target — and
+        // the containment gate refuses that policy at press time.
+        guard case let .systemDialog(always) = DesktopRouter.route(
+            window: browserUseCard(), cardsAllowed: false,
+            policies: DesktopPolicies(dialog: .always)
+        ) else { return XCTFail("still a dialog") }
+        XCTAssertNotNil(always.target)
     }
 
     /// Chrome's remote-debugging wording is recognised even outside the app list.
-    func testChromeRemoteDebuggingDialogIsAnswered() {
+    func testChromeRemoteDebuggingDialogIsRoutedToContainment() {
         let dialog = win([
             txt("Allow remote debugging?"),
             txt("An external app wants full control over this Chrome session to debug it."),
@@ -110,8 +124,12 @@ final class DesktopRouterTests: XCTestCase {
         ])
         guard case let .systemDialog(d) = DesktopRouter.route(
             window: dialog, cardsAllowed: false, policies: DesktopPolicies()
-        ) else { return XCTFail("Chrome's dialog must be answered") }
-        XCTAssertEqual(d.target?.label, "Allow")
+        ) else { return XCTFail("Chrome's dialog must be owned by containment") }
+        XCTAssertNil(d.target)
+        guard case let .systemDialog(always) = DesktopRouter.route(
+            window: dialog, cardsAllowed: false, policies: DesktopPolicies(dialog: .always)
+        ) else { return XCTFail("still a dialog") }
+        XCTAssertEqual(always.target?.label, "Allow")
     }
 
     func testChromeNativeDialogSurfaceWithStrictWordingGate() {
@@ -124,7 +142,7 @@ final class DesktopRouterTests: XCTestCase {
         for cardsAllowed in [false, true] {
             guard case let .systemDialog(d) = DesktopRouter.route(
                 window: surface, cardsAllowed: cardsAllowed,
-                policies: DesktopPolicies(), requireTrigger: true
+                policies: DesktopPolicies(dialog: .always), requireTrigger: true
             ) else { return XCTFail("native Chrome dialog must use the dialog policy") }
             XCTAssertEqual(d.target?.label, "Allow")
             XCTAssertEqual(d.options.filter { $0.kind.grantsAccess }.map(\.label), ["Allow"])
@@ -230,5 +248,44 @@ final class DesktopRouterTests: XCTestCase {
     func testExtraAppsCanBeNamedByLocalizedName() {
         let needles = AgentApps.defaults + ["Cursor"]
         XCTAssertTrue(AgentApps.isWatched(name: "Cursor", bundleID: "com.todesktop.x", in: needles))
+    }
+
+    // MARK: - a native surface is never a card
+
+    /// A sheet is a native surface even when it offers the grant+deny pair the
+    /// card detector likes. Containment owns it; the card channel may not press
+    /// it, whatever the button wording or tier.
+    func testASheetWithGrantAndDenyIsStillANativeDialog() {
+        let sheet = node("AXSheet", [
+            txt("\u{201C}ChatGPT\u{201D} wants access to control \u{201C}Finder\u{201D}."),
+            btn("Don\u{2019}t Allow"), btn("Allow Once"),
+        ])
+        guard case .systemDialog = DesktopRouter.route(
+            window: sheet, cardsAllowed: true, policies: DesktopPolicies()
+        ) else { return XCTFail("a sheet is a native surface, not a card") }
+    }
+
+    /// A sheet whose wording no keyword list knows must not fall back to the
+    /// card path just because its button says "Allow once".
+    func testAnUnrecognisedSheetNeverFallsThroughToTheCardPath() {
+        let sheet = node("AXSheet", [
+            txt("Something new"), btn("Don\u{2019}t Allow"), btn("Allow once"),
+        ])
+        if case .card = DesktopRouter.route(
+            window: sheet, cardsAllowed: true, policies: DesktopPolicies()
+        ) {
+            XCTFail("a sheet must never be pressed through the card channel")
+        }
+    }
+
+    func testADialogRoleIsNeverACard() {
+        let dialog = node("AXDialog", [
+            txt("Something new"), btn("Deny"), btn("Allow once"),
+        ])
+        if case .card = DesktopRouter.route(
+            window: dialog, cardsAllowed: true, policies: DesktopPolicies()
+        ) {
+            XCTFail("AXDialog must never be pressed through the card channel")
+        }
     }
 }

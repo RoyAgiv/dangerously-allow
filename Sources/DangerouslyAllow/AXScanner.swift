@@ -3,17 +3,17 @@ import ApplicationServices
 import DangerouslyAllowCore
 
 struct GuiWatchOptions {
-    /// `always` by default, unlike the other paths. A TCC dialog almost never
-    /// offers a session- or once-scoped button, so a `session` default would
-    /// make `gui` a no-op on the common dialogs. Neutral and deny stay
-    /// unpressable regardless of policy, so this presses grants only.
-    var policy: AllowPolicy = .always
+    /// `once` by default. A TCC dialog's plain "Allow" is a permanent grant
+    /// however mildly it is worded, so only an explicitly one-shot button is
+    /// ever eligible — and even that needs the containment gate's capability.
+    var policy: AllowPolicy = .once
     var dryRun = false
     var stopAfterFirst = false
     var pollInterval: TimeInterval = 0.5
     var neverApprove: [String] = []
     /// Gate dialogs on recognised wording — see `DesktopOptions`. Off by
-    /// default; `--require-trigger` puts it back.
+    /// default for discovery, but the containment gate always requires it
+    /// before a press.
     var requireTrigger = false
     /// Log every dialog-shaped window and why it was passed over — for
     /// diagnosing wording the keyword list does not know yet.
@@ -21,6 +21,9 @@ struct GuiWatchOptions {
     /// Print every window carrying any text once, then exit.
     var dump = false
     var notify = false
+    /// Native-GUI containment. Nil is treated as "no capability", so it can
+    /// only observe.
+    var gate: NativeGuiGate?
 }
 
 /// Auto-clicks native macOS TCC dialogs (Microphone, Screen Recording,
@@ -32,18 +35,15 @@ struct GuiWatchOptions {
 /// presented by whichever process the system chose, so every running app is
 /// scanned. `SystemDialogDetector` decides what is a dialog, and — because a
 /// grant here is written to the TCC database and outlives the process — the
-/// default `session` policy declines a plain "Allow" and leaves it to a human.
+/// channel is observe-only until the containment gate holds a signed one-use
+/// capability, and even then only an explicit one-shot button is eligible.
 enum AXScanner {
     static func run(options: GuiWatchOptions) {
-        Log.info("scanning for macOS permission dialogs\(options.dryRun ? "  (DRY RUN — nothing pressed)" : "")")
+        Log.info("scanning for macOS permission dialogs\(options.dryRun ? "  (DRY RUN)" : "")")
         Log.info("policy: \(options.policy.rawValue)  poll: \(options.pollInterval)s — Ctrl+C to stop")
-        if options.policy == .always {
-            Log.info("a TCC grant is permanent — this presses \"Allow\"; refusals and")
-            Log.info("  \"Open System Settings\" are never pressed. --policy session to be cautious")
-        } else {
-            Log.info("a TCC grant is permanent, so --policy \(options.policy.rawValue) presses only")
-            Log.info("  explicitly one-shot buttons (\"Allow Once\"); use --policy always for \"Allow\"")
-        }
+        Log.info("native dialogs: \(options.gate?.summary ?? "observe-only — no gate")")
+        Log.info("a TCC grant is permanent — a plain \"Allow\" is never pressed; a press")
+        Log.info("  needs an explicit one-shot button plus a valid one-use capability")
         if !options.neverApprove.isEmpty {
             Log.info("never-approve: \(options.neverApprove.joined(separator: ", "))")
         }
@@ -161,7 +161,7 @@ enum AXScanner {
                         }
                         seen.insert(dialog.fingerprint)
                         guard handled.insert(dialog.fingerprint).inserted else { continue }
-                        if handle(dialog, appName: name) {
+                        if handle(dialog, appName: name, pid: app.processIdentifier) {
                             pressed = true
                             lastAnswered = app.processIdentifier
                             if opts.stopAfterFirst { return true }
@@ -180,9 +180,10 @@ enum AXScanner {
         }
 
         /// Returns true when the dialog was confirmed.
-        private func handle(_ dialog: DetectedSystemDialog, appName: String) -> Bool {
+        private func handle(_ dialog: DetectedSystemDialog, appName: String, pid: pid_t) -> Bool {
             if let blocked = PromptDetector.blockingPattern(
-                screen: dialog.fullText, neverApprove: opts.neverApprove
+                screen: dialog.fullText,
+                neverApprove: NativeGuiContainment.effectiveNeverApprove(opts.neverApprove)
             ) {
                 Log.warn("REFUSING — dialog matches --never-approve /\(blocked)/")
                 Log.warn("  leaving for a human: \(dialog.dialogText.prefix(140))")
@@ -209,6 +210,25 @@ enum AXScanner {
                 Log.info("  [dry-run] pressed nothing")
                 return false
             }
+
+            // The single native-GUI press path. A dry run returns above, so it
+            // never consumes a capability's nonce.
+            let decision = opts.gate?.authorize(
+                promptFingerprint: dialog.fingerprint,
+                promptText: dialog.dialogText,
+                targetLabel: target.label,
+                targetKind: target.kind,
+                triggerRecognized: SystemDialogDetector.hasRecognizedTrigger(dialog.fullText),
+                pid: pid
+            ) ?? .observe(.missingCapability)
+            guard case let .press(action) = decision else {
+                Log.warn("  observe-only — not pressed (\(decision.reason))")
+                if opts.notify { Notify.post("Permission dialog in \(appName) left for a human") }
+                return false
+            }
+            Log.info("  one-use capability \(action.capabilityNonce.prefix(8))… "
+                + "authorises this press (task \(action.taskID))")
+
             guard let err = tree.press(target.id) else {
                 Log.error("  lost the button between scan and press — leaving it")
                 return false

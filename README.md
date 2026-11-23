@@ -3,17 +3,19 @@
 Auto-approves the permission prompts the **Claude and ChatGPT desktop apps** put
 in your way, on macOS.
 
-> **Read this before running it.** This tool presses "Allow" on prompts that
-> exist to protect you. It grants an agent permission to act on your machine
-> without your individually approving each step. Use it on work you can afford
-> to lose, in a directory under version control, and start with `--dry-run`.
+> **Read this before running it.** This tool can press "Allow" on prompts that
+> exist to protect you. A bare invocation is observe-only and presses nothing;
+> the click-capable paths are an approved app's own cards (`app <name>`) and a
+> containment-gated native dialog with a signed one-use capability. Use it on
+> work you can afford to lose, in a directory under version control, and start
+> with `--dry-run`.
 
 ```bash
 dangerously-allow
 ```
 
-That is the whole thing. No subcommand, no sudo — it watches everything the
-desktop agents can ask for:
+That is the whole thing. No subcommand, no sudo — it observes everything the
+desktop agents can ask for, and presses nothing:
 
 | Prompt | Example |
 | --- | --- |
@@ -43,7 +45,7 @@ make uninstall
 secondary terminal-agent mode (`brew install tmux`).
 
 ```bash
-make check                # 120 unit tests + 12 end-to-end tests through real tmux
+make check                # 152 unit tests + 12 tmux end-to-end + 22 containment
 make help                 # list targets
 ```
 
@@ -54,42 +56,44 @@ earlier versions asked for.
 ## Use
 
 ```bash
-dangerously-allow                               # the usual: watch everything
-dangerously-allow --dry-run --verbose           # see what it would press, press nothing
+dangerously-allow                               # observe the desktop, press nothing
+dangerously-allow --dry-run --verbose           # see what it would press
+dangerously-allow app ChatGPT                   # answer ChatGPT's approval cards
+dangerously-allow app com.t3tools.t3code        # answer T3's approval cards
 dangerously-allow --never-approve 'Full Disk Access'
-dangerously-allow --app Cursor                  # answer another app's cards too
 ```
 
-Anything shaped like a prompt — a window with a handful of buttons, one of
-which grants something — is answered wherever it appears, whatever its wording.
-That includes prompts no keyword list knows: Chrome's "Allow remote debugging?"
-is nobody's TCC sentence, and it is answered all the same. `--require-trigger`
-narrows this back to prompts whose wording is recognised.
+A bare invocation is **observe-only**. It sweeps the desktop and logs what it
+sees, but it presses nothing: neither a native permission dialog nor an in-app
+card. That is the safe default for a machine that may also be running agents
+nobody supervised — a permission-shaped window can belong to any process, and
+pressing its "Allow" creates a system grant.
 
-Chrome/Chromium native dialog groups and sheets are also scanned separately
-when embedded in the browser window. Discovery skips `AXWebArea` content, so
-web-page dialogs are not promoted to native permission prompts. The remote
-debugging confirmation uses the dialog policy: the default presses **Allow**,
-never **Cancel** or **Turn off in settings**; `--policy session` leaves it alone.
+Answering an app's own approval cards is an explicit, narrow request: name an
+approved app with `app <name>`. The two pinned identities are ChatGPT
+(`com.openai.codex`, team `2DC432GLL2`) and T3 (`com.t3tools.t3code`, team
+`ARK85ZXQ4Z`); the running app's code signature is checked against its
+designated requirement at press time, so an unsigned bundle that calls itself
+"ChatGPT" is not enough. Any other app is rejected with a usage error.
 
-The native-dialog detector skips `AXWebArea` documents, including small popups
-without a browser toolbar. Approval *cards* are still only answered in apps on a list — the ChatGPT
-and Claude desktop apps, and notification banners — so that a card keeps the
-cautious card policy and its one-shot "Allow once". `--app` extends that list,
-by localized name or bundle id.
+The whole-desktop mode can also answer cards, but only when you opt in:
 
-Several prompts at once are answered in one sweep, and a sweep that pressed
-something looks again immediately instead of sleeping out the poll interval —
-so a queue of dialogs drains as fast as the apps can put them up.
+```bash
+dangerously-allow --app ChatGPT --approve-cards
+```
 
-The three channels can still be run one at a time, which is mostly useful with
+That presses cards in ChatGPT's verified windows and still observes every native
+dialog. Without `--approve-cards`, `--app` only scopes what is observed.
+
+The three channels can be run one at a time, which is mostly useful with
 `--dump` when a prompt is not recognised and you want the AX tree to paste into
 an issue:
 
 ```bash
 dangerously-allow app ChatGPT --dump            # one app's pruned AX tree
 dangerously-allow gui --verbose --dry-run       # dialogs it passed over, and why
-dangerously-allow notifications
+dangerously-allow gui --containment-status      # what containment resolved
+dangerously-allow notifications                 # observe banners only
 ```
 
 ### Terminal agents (secondary)
@@ -119,31 +123,33 @@ as `.allowOnce`. Routed there, the cautious card policy would press a permanent
 system grant believing it was a one-shot. `DesktopRouter` exists to make that
 ordering explicit, and `DesktopRouterTests` pins it.
 
-So the system-dialog channel **defaults to `--policy always`** and presses that
-"Allow", while cards default to `session`. The reason is structural: a TCC
-dialog almost never
-offers a session- or once-scoped button, so a `session` default — which only
-presses grants that die with the process — would leave the common dialogs
-untouched, doing nothing on the very prompt you ran it for. What still holds is
-that **a refusal or a neutral button is never pressed, under any policy** — the
-target is drawn only from `AllowPolicy.preference`, which lists grant kinds
-alone:
+So the system-dialog channel **defaults to `--policy once`** and, even then, does
+not press without a valid containment capability (see CONTAINMENT below). A
+plain "Allow" is a `.allowAlways` grant, so it is never eligible: the gate is
+pinned to the one-shot tier, and an explicit "Allow Once" is the only button a
+capability can authorise. What always holds is that **a refusal or a neutral
+button is never pressed, under any policy** — the target is drawn only from
+`AllowPolicy.preference`, which lists grant kinds alone:
 
-| Button | Kind | default (`always`) | `--policy session` |
+| Button | Kind | `--policy once` (default) | `--policy always` |
 | --- | --- | --- | --- |
-| "Allow", "OK" | `allowAlways` | pressed | left for a human |
-| "Allow While Using App" | `allowAlways` | pressed | left — a permanent entry with a usage condition, not a bounded grant |
-| "Allow Once" (Location) | `allowOnce` | pressed (fallback) | pressed |
+| "Allow", "OK" | `allowAlways` | never (and the gate still requires a capability) | never pressed by this executable: a permanent grant |
+| "Allow While Using App" | `allowAlways` | never — a permanent entry with a usage condition, not a bounded grant | never |
+| "Allow Once" (Location) | `allowOnce` | eligible, but only with a valid one-use capability | eligible with a capability |
 | "Open System Settings", "Learn More" | `neutral` | never | never |
 | "Don't Allow", "Cancel" | `deny` | never | never |
 
-So `--policy session` is the cautious knob: it leaves permanent TCC grants for
-a human and presses only an explicit "Allow Once". The other difference from
-the `app` path: a system dialog need not offer a refusal. macOS 15's
-screen-capture prompt offers "Allow" and "Open System Settings" and nothing
-else — the way out is Esc — so the grant-and-refusal invariant cannot apply
-here. What stands in for it is the shape (at most five buttons), a button that
-grants something, and the policy ceiling above. Recognised wording is *not*
+`--policy always` does not widen the native channel. The executable treats the
+native-GUI tier as `once` regardless of what was asked, reports
+`policy_not_one_shot` in `--containment-status`, and observes. That is the
+direct-CLI bypass this change closes: `dangerously-allow gui --policy always`
+cannot become click-capable through flags alone.
+
+The other difference from the `app` path: a system dialog need not offer a
+refusal. macOS 15's screen-capture prompt offers "Allow" and "Open System
+Settings" and nothing else — the way out is Esc — so the grant-and-refusal
+invariant cannot apply here. What stands in for it is the shape (at most five
+buttons), a button that grants something, and the containment gates. Recognised wording is *not*
 required by default: a keyword list only knows the prompts someone has already
 transcribed, and every sentence it has not met — Chrome's remote-debugging
 dialog, the next OS release's rephrasing — was being walked past in silence.
@@ -156,14 +162,114 @@ wording is the thing that goes stale. macOS 15's screen-capture prompt says
 neither "would like to access" nor "Screen Recording", which is exactly how it
 slipped past an earlier keyword list.
 
+## Containment
+
+The native-GUI channel is contained at the executable entrypoint. Every
+`gui`/whole-desktop scan, the `app` card channel and `notifications` construct a
+containment gate from the actual argv and environment, and the only press path
+for a native dialog or banner asks that gate first. A `nil` gate — which is what
+a missing flag, an unreadable capability, or a future refactor would produce —
+is treated as "no capability", so it can only observe.
+
+A native press needs **all five**:
+
+1. **Recognised wording.** The prompt must match a shipped permission sentence
+   (`SystemDialogDetector.hasRecognizedTrigger`). An unrecognised
+   permission-shaped window is observed, not answered.
+2. **A nonempty operator policy.** At least one `--never-approve` pattern must
+   be given. A baseline of credential/security phrases (`password`, `keychain`,
+   `FileVault`, `System Settings`, `Full Disk Access`, `sudo`, …) is always
+   applied on top, and is never a substitute for the operator's own list.
+3. **One-shot authorization.** The policy must be `once`; anything broader is
+   refused, never clamped.
+4. **A pinned app identity.** The window must belong to a running app whose live
+   code signature satisfies its designated requirement, and the capability must
+   name that same bundle id, team id and requirement SHA-256. Pinned:
+   ChatGPT `com.openai.codex` / `2DC432GLL2` and T3 `com.t3tools.t3code` /
+   `ARK85ZXQ4Z`. Everything else is `app_not_approved`.
+5. **A short-lived, single-use capability** signed by a trusted issuer, bound to
+   this host, task, channel, prompt fingerprint and app.
+
+The capability is a JSON envelope. The payload is canonical JSON (sorted keys,
+string values, no whitespace) and the signature is ES256-DER over those bytes,
+the same shape macs-connect already uses for owner grants:
+
+```json
+{
+  "Schema": "dangerously-allow-native-gui-action/v1",
+  "Algorithm": "ES256-DER",
+  "Payload": {
+    "Domain": "dangerously-allow-native-gui-action/v1",
+    "Purpose": "native-gui-approve",
+    "Host": "hyde-m6-2.local",
+    "Task_Id": "…", "Session_Id": "…", "Request_Id": "…",
+    "App_Bundle_Id": "com.openai.codex",
+    "App_Team_Id": "2DC432GLL2",
+    "App_Requirement_SHA256": "…",
+    "Action": "system-dialog-approve",
+    "Prompt_Fingerprint": "…",
+    "Nonce": "…", "Issued_At": "…", "Expires_At": "…"
+  },
+  "Signature": "base64 DER",
+  "Issuer_Public_Key_Pem": "-----BEGIN PUBLIC KEY-----…"
+}
+```
+
+The issuer's fingerprint is the SHA-256 of its SubjectPublicKeyInfo DER
+(`openssl pkey -pubin -outform DER`). It is trusted only if it appears in
+`--trusted-issuer` (or `DANGEROUSLY_ALLOW_TRUSTED_ISSUERS`). With no trust
+entry — the default — no capability can pass. A capability may live at most 120
+seconds, is checked against the clock with five seconds of skew, and its nonce
+is consumed exactly once through an `O_CREAT|O_EXCL` ledger under
+`~/Library/Application Support/dangerously-allow/native-gui-replay` (override
+with `--replay-store`). A denial never consumes the nonce; only a fully
+authorised press does.
+
+`Task_Id` and `Session_Id` are **correlators, not credentials**. They are
+compared to narrow what a signature may authorise, and a capability with the
+right task but no valid signature authorises nothing. No task id, session id,
+environment variable or CLI flag makes the channel click-capable on its own.
+
+### There is no issuer yet
+
+macs-connect has no authenticated path that mints an application-action
+capability. Its request receipts (including PR #1595) are integrity-hashed
+*provenance evidence*, not signed authorisations, and its closest signed
+contract — `Check_Runtime_Upgrade_Grant`'s ES256-DER owner grant — is bound to a
+runtime-upgrade plan and issued offline by the owner. So click-capable native
+GUI stays fail-closed: in this build `--policy always` observes, and a valid
+capability can only be produced by an out-of-band issuer the operator trusts
+explicitly.
+
+What a real issuer must provide, before this channel can press anything:
+
+* an owner-authenticated gateway operation (a tool, not a new daemon) that
+  accepts a task-bound request and returns this envelope;
+* the payload above with a ≤120 s lifetime and a fresh 32-byte nonce;
+* signature by an enrolled key whose SPKI SHA-256 is published to the executing
+  host's trust set;
+* a durable one-use nonce record shared with the executor (or a ledger the
+  executor can atomically claim);
+* the pinned app identity and the exact prompt fingerprint the supervisor
+  observed.
+
+Until that exists, the honest claim is containment, not approval: this
+executable never presses a native permission dialog.
+
+`--containment-status` prints the resolved configuration and the reasons it is
+observe-only. `--containment-check` runs one full evaluation against an
+installed app's live signature and prints the decision; it consumes the nonce on
+success and presses nothing. `tools/containment-test.sh` mints throwaway test
+keys and drives both, without opening a consent dialog or touching TCC.
+
 ## Approval cards, and notification banners
 
-The ChatGPT desktop app (`com.openai.codex`) and the Claude desktop app
-(`com.anthropic.claudefordesktop`) ask for approval with a card — "Allow once",
-"Always allow", "Deny" — not a TUI menu, so the tmux channel cannot see it. But
-unlike a terminal drawing, the card is real UI, and it is fully visible to the
-Accessibility API. Both are answered by default; `--app` adds others. To watch
-just one:
+The ChatGPT desktop app (`com.openai.codex`) and T3 (`com.t3tools.t3code`) ask
+for approval with a card — "Allow once", "Always allow", "Deny" — not a TUI
+menu, so the tmux channel cannot see it. But unlike a terminal drawing, the card
+is real UI, and it is fully visible to the Accessibility API. `app <name>` is
+the only click-capable card mode, and it only accepts those two pinned
+identities; other apps are rejected. To watch just one:
 
 ```bash
 dangerously-allow app ChatGPT                     # session policy: presses "Allow once"
@@ -182,12 +288,13 @@ command it shows.
 
 Notification banners are the same idea with a twist: Notification Center
 exposes a banner's buttons as AX *actions on the banner element*, not as child
-buttons. `notifications` watches for banners that offer an Allow-style action
-and presses it:
+buttons. `notifications` watches for banners that offer an Allow-style action,
+but it is observe-only: the poster cannot be attested from the banner, so the
+containment gate declines to press even with a capability.
 
 ```bash
 dangerously-allow notifications --dry-run     # see what it would press
-dangerously-allow notifications
+dangerously-allow notifications               # observe only
 ```
 
 A banner with no grant action — your average "meeting in 5 minutes" — offers
@@ -228,8 +335,8 @@ existed.
 
 | Policy | Clicks | Falls back to |
 | --- | --- | --- |
-| `once` | "Yes", "Allow once" | — |
-| `session` *(default)* | "Allow for this session" | a one-time allow |
+| `once` *(default for native dialogs)* | "Yes", "Allow once" | — |
+| `session` *(default for cards)* | "Allow for this session" | a one-time allow |
 | `always` | "Allow for all future sessions", "don't ask again", "Trust folder" | session, then once |
 
 Folder trust ("Do you trust the files in this folder?") is classified as a
@@ -307,19 +414,23 @@ claim here is one grep away in `Sources/DangerouslyAllowCore/`:
   In the ChatGPT app, `session` presses "Allow once", because the card offers
   no session-scoped button.
 - In `run`/`watch` it reads and writes exactly one tmux pane: the one you name.
-- In `app` it reads the AX tree of the one app you name, and presses at most
-  one option on a card that offers both a grant and a refusal.
+- In `app` it reads the AX tree of the one pinned app you name, verifies that
+  app's signature, and presses at most one option on a card that offers both a
+  grant and a refusal. No other app is accepted.
+- A bare invocation presses nothing at all: no native dialog, no card, no
+  banner. Card presses require `--app <pinned> --approve-cards`; native presses
+  require a signed, single-use capability plus every gate in CONTAINMENT.
 - No telemetry and no config file. It makes **no network call unless you pass
   `--llm-fallback`** — which sends unrecognised menus to the Anthropic API, and
-  nothing else. The only file it writes is the watcher log: `--log <file>`, or a
-  temp file whose path `run` prints on startup.
+  nothing else. The files it writes are the watcher log (`--log <file>`) and,
+  only after an authorised native press, the one-use nonce ledger.
 
-The `gui` mode is the exception to the last two points: it scans the
-Accessibility tree of every running app to find TCC dialogs, since the system
-picks which process presents one. It presses at most one button per dialog —
-never a refusal, never a neutral like "Open System Settings" — and defaults to
-`--policy always` because a TCC grant is permanent by nature; pass
-`--policy session` to leave those permanent grants for a human.
+`gui` scans the Accessibility tree of every running app to find TCC dialogs,
+since the system picks which process presents one. It observes by default. A
+press needs recognised wording, an operator `--never-approve` pattern, the
+one-shot tier, a pinned app whose live signature satisfies its designated
+requirement, and a trusted single-use capability. `--policy always` is reported
+as `policy_not_one_shot` and is never a way around the gate.
 
 ## A safer alternative first
 
@@ -350,11 +461,14 @@ Sources/DangerouslyAllowCore/    pure logic, no I/O — where the tests live
   ButtonPrompt.swift             approval cards in a UI element tree
   SystemDialog.swift             native macOS permission dialogs
   DesktopRouter.swift            which detector owns a window; the watched apps
+  NativeGuiContainment.swift     pinned identities, capability gate, one-use ledger
 Sources/DangerouslyAllow/
   AXTree.swift                   the only file that touches AXUIElement
   DesktopWatcher.swift           the default mode: all three channels, one loop
   AppWatcher.swift               `app` / `notifications`: one app's cards
   AXScanner.swift                `gui`: every app's AX tree -> SystemDialog
+  NativeGuiGate.swift            code-signature probe, capability loading, ledger
+  ContainmentOptions.swift       containment flags, status and check output
   TmuxChannel.swift              capture-pane / send-keys
   Watcher.swift                  closed-loop poll -> navigate -> confirm
   Runner.swift                   `run`: start the agent in tmux, spawn the watcher
@@ -362,6 +476,7 @@ Sources/DangerouslyAllow/
   Notify.swift                   `--notify` macOS notifications
 tools/mock-prompt.js             a fake agent menu that renders like the real ones
 tools/integration-test.sh        drives it through real tmux
+tools/containment-test.sh        executable-level native GUI containment tests
 ```
 
 Labels and rendering were taken from the shipped harnesses, not guessed —

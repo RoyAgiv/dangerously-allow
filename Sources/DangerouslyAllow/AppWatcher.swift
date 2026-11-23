@@ -19,6 +19,14 @@ struct AppWatchOptions {
     /// Print each window's pruned AX tree once and exit — for capturing the
     /// labels of a card the classifier does not know yet.
     var dump = false
+    /// Set for `app <name>`: the card channel only runs for this pinned
+    /// identity, and the running app's signature must satisfy its requirement.
+    var pinnedApp: ApprovedAppIdentity?
+    /// Set for `notifications`: pressing goes through the native-GUI gate,
+    /// which cannot attest the banner's poster and therefore declines.
+    var nativeGuiChannel: NativeGuiContainment.Channel?
+    var gate: NativeGuiGate?
+    var probe: AppIdentityProbing = CodeSigningIdentityProbe()
 }
 
 /// Polls an app's Accessibility tree, and when an approval card appears —
@@ -37,6 +45,8 @@ final class AppWatcher {
     /// screen — the same lingering-frame guard `Watcher` uses, as a set so that
     /// several cards up at once do not make each other forgotten.
     private var handled: Set<String> = []
+    private var warnedUnverified = false
+    private var warnedNative = false
 
     private let tree = AXTree()
 
@@ -50,7 +60,14 @@ final class AppWatcher {
             Log.warn("  System Settings → Privacy & Security → Accessibility")
         }
         Log.info("watching app '\(opts.appName)' for approval cards")
-        Log.info("policy: \(opts.policy.rawValue)\(opts.dryRun ? "  (DRY RUN — nothing pressed)" : "")")
+        Log.info("policy: \(opts.policy.rawValue)\(opts.dryRun ? "  (DRY RUN)" : "")")
+        if let pinned = opts.pinnedApp {
+            Log.info("pinned identity: \(pinned.displayName) \(pinned.bundleID), "
+                + "team \(pinned.teamID) — signature required")
+        }
+        if let channel = opts.nativeGuiChannel {
+            Log.info("native channel: \(channel.rawValue) — \(opts.gate?.summary ?? "observe-only")")
+        }
         if !opts.neverApprove.isEmpty {
             Log.info("never-approve: \(opts.neverApprove.joined(separator: ", "))")
         }
@@ -83,6 +100,21 @@ final class AppWatcher {
         var seen: Set<String> = []
         var pressed = false
         for app in apps {
+            if let pinned = opts.pinnedApp, !opts.dump {
+                let identity = opts.probe.identity(forPID: app.processIdentifier)
+                guard identity?.bundleID == pinned.bundleID,
+                      identity?.teamID == pinned.teamID,
+                      identity?.satisfiesPinnedRequirement == true
+                else {
+                    if !warnedUnverified {
+                        Log.warn("refusing '\(app.localizedName ?? opts.appName)': its live "
+                            + "signature does not satisfy the pinned requirement")
+                        warnedUnverified = true
+                    }
+                    continue
+                }
+                warnedUnverified = false
+            }
             for window in tree.windows(ofPID: app.processIdentifier) {
                 guard let root = tree.build(window, within: 1.5) else { continue }
                 if opts.dump {
@@ -90,12 +122,11 @@ final class AppWatcher {
                     dump(root, indent: 1)
                     continue
                 }
-                guard let prompt = ButtonPromptDetector.detect(
-                    root: root, policy: opts.policy, requireTrigger: opts.requireTrigger
-                ) else { continue }
+                guard let prompt = card(in: root) else { continue }
                 seen.insert(prompt.fingerprint)
                 guard handled.insert(prompt.fingerprint).inserted else { continue }
-                if handle(prompt, appName: app.localizedName ?? opts.appName) {
+                if handle(prompt, appName: app.localizedName ?? opts.appName,
+                          pid: app.processIdentifier) {
                     pressed = true
                     if opts.stopAfterFirst { return true }
                 }
@@ -105,10 +136,35 @@ final class AppWatcher {
         return pressed
     }
 
+    /// Route one window the same way the desktop mode does: a native
+    /// sheet/dialog is never an in-app card, so `app` mode observes it instead
+    /// of pressing it. Only `.card` is returned; everything else is nil.
+    private func card(in root: UINode) -> DetectedButtonPrompt? {
+        switch DesktopRouter.route(
+            window: root,
+            cardsAllowed: true,
+            policies: DesktopPolicies(dialog: .once, card: opts.policy),
+            requireTrigger: opts.requireTrigger
+        ) {
+        case let .card(prompt):
+            return prompt
+        case .systemDialog:
+            if !warnedNative {
+                Log.warn("native dialog surface in '\(opts.appName)' — observe-only; "
+                    + "the app channel never presses a native permission dialog")
+                warnedNative = true
+            }
+            return nil
+        case .ignored:
+            return nil
+        }
+    }
+
     /// Returns true when the card was confirmed.
-    private func handle(_ prompt: DetectedButtonPrompt, appName: String) -> Bool {
+    private func handle(_ prompt: DetectedButtonPrompt, appName: String, pid: pid_t) -> Bool {
         if let blocked = PromptDetector.blockingPattern(
-            screen: prompt.fullText, neverApprove: opts.neverApprove
+            screen: prompt.fullText,
+            neverApprove: NativeGuiContainment.effectiveNeverApprove(opts.neverApprove)
         ) {
             Log.warn("REFUSING — card matches --never-approve /\(blocked)/")
             Log.warn("  leaving for a human: \(prompt.cardText.prefix(140))")
@@ -136,6 +192,25 @@ final class AppWatcher {
             return false
         }
 
+        // Notification banners are a native channel: the poster is not
+        // attestable, so containment declines to press even with a capability.
+        if let channel = opts.nativeGuiChannel {
+            let decision = opts.gate?.authorize(
+                promptFingerprint: prompt.fingerprint,
+                promptText: prompt.cardText,
+                targetLabel: target.label,
+                targetKind: target.kind,
+                triggerRecognized: true,
+                pid: pid
+            ) ?? .observe(.missingCapability)
+            guard case let .press(action) = decision else {
+                Log.warn("  observe-only — \(channel.rawValue) not pressed (\(decision.reason))")
+                if opts.notify { Notify.post("Banner in \(appName) left for a human") }
+                return false
+            }
+            Log.info("  one-use capability \(action.capabilityNonce.prefix(8))… authorises this press")
+        }
+
         guard let err = tree.press(target.id) else {
             Log.error("  lost the element between scan and press — leaving it")
             return false
@@ -149,8 +224,13 @@ final class AppWatcher {
     }
 
     private func matchingApps() -> [NSRunningApplication] {
-        let needle = opts.appName.lowercased()
         let all = NSWorkspace.shared.runningApplications
+        if let pinned = opts.pinnedApp {
+            // Bundle id only: a localized name is not an identity, and a
+            // lookalike bundle must not be swept up by a substring match.
+            return all.filter { $0.bundleIdentifier == pinned.bundleID }
+        }
+        let needle = opts.appName.lowercased()
         let exact = all.filter {
             $0.localizedName?.lowercased() == needle || $0.bundleIdentifier?.lowercased() == needle
         }

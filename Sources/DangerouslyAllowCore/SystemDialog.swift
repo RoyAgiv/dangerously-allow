@@ -105,6 +105,14 @@ public enum SystemDialogDetector {
         return .allowAlways
     }
 
+    /// True when the dialog wording matches a shipped permission sentence.
+    /// Used both by `--require-trigger` and by the containment gate, which
+    /// refuses to press a native dialog whose wording it does not recognise.
+    public static func hasRecognizedTrigger(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        return permissionKeywords.contains { lowered.contains($0) }
+    }
+
     /// `requireTrigger` gates on the wording list above. The watchers leave it
     /// off: the list is transcribed from dialogs that shipped, so it only ever
     /// knows the past, and every sentence it has not met yet — Chrome's
@@ -126,8 +134,7 @@ public enum SystemDialogDetector {
 
         let dialogText = texts.joined(separator: " ")
         if requireTrigger {
-            let lowered = dialogText.lowercased()
-            guard permissionKeywords.contains(where: { lowered.contains($0) }) else {
+            guard hasRecognizedTrigger(dialogText) else {
                 return .skipped(.noPermissionWording)
             }
         }
