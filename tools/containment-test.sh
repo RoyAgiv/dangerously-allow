@@ -304,6 +304,48 @@ for f in "$TMP"/claim-*.json; do
 done
 check "concurrent claimers produce exactly one press claim" "1" "$winners"
 
+# ---- the default host must be a stable identity, not reverse DNS --------
+# A04: ProcessInfo.hostName returned hyde-m6-2, hyde-m6-2.local and
+# hyde-m6-2.tail6f7ef3.ts.net on the same host, so an unpinned watcher keyed
+# one card to several ledger identities. The default is now the stable local
+# name's first DNS label; an explicit --host still wins verbatim.
+DEFAULT_HOSTS=()
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    DEFAULT_HOSTS+=("$("$BIN" gui --containment-status | json Host)")
+done
+DEFAULT_HOST_UNIQUE="$(printf '%s\n' "${DEFAULT_HOSTS[@]}" | sort -u | wc -l | tr -d ' ')"
+check "the default host is stable across processes" "1" "$DEFAULT_HOST_UNIQUE"
+case "$HOST" in
+    "") echo "  ✗ the default host is nonempty"; fail=$((fail + 1)) ;;
+    *.*) echo "  ✗ the default host is a canonical first label"; fail=$((fail + 1)) ;;
+    *) echo "  ✓ the default host is a canonical first label"; pass=$((pass + 1)) ;;
+esac
+LOCAL_HOST="$(scutil --get LocalHostName 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+check "the default host is the stable local name" "$LOCAL_HOST" "$HOST"
+check "an explicit --host override wins" "pinned-override" \
+    "$("$BIN" gui --containment-status --host pinned-override | json Host)"
+
+DEFAULT_CARD="$TMP/card-default-host"
+DEFAULT_CARD_ARGS=(app com.openai.codex --card-claim-check
+    --card-window "ax-id:default-host-window" --card-prompt "Allow|Deny§default host"
+    --card-store "$DEFAULT_CARD")
+DEFAULT_FIRST="$("$BIN" "${DEFAULT_CARD_ARGS[@]}")"
+DEFAULT_SECOND="$("$BIN" "${DEFAULT_CARD_ARGS[@]}")"
+check "the default host claims a card once" "true" \
+    "$(printf '%s' "$DEFAULT_FIRST" | json Claimed)"
+check "the default host rejects the re-presented card" "duplicate_card_press" \
+    "$(printf '%s' "$DEFAULT_SECOND" | json Reason)"
+CARD_NO_HOST="$("$BIN" app com.openai.codex --card-claim-check --host "" \
+    --card-window "ax-id:no-host" --card-prompt "Allow|Deny§no host" \
+    --card-store "$TMP/card-no-host")"
+check "an undeterminable host is refused" "incomplete_card_identity" \
+    "$(printf '%s' "$CARD_NO_HOST" | json Reason)"
+if grep -Rq "host = ProcessInfo.processInfo.hostName" Sources; then
+    echo "  ✗ no watcher keys durable state on reverse DNS"; fail=$((fail + 1))
+else
+    echo "  ✓ no watcher keys durable state on reverse DNS"; pass=$((pass + 1))
+fi
+
 # ---- a pin must not be confused with the shipped requirement hash -------
 case "$CHATGPT_REQ" in
     [0-9a-f][0-9a-f][0-9a-f]*) echo "  ✓ the ChatGPT pin resolves to a SHA-256"; pass=$((pass + 1)) ;;

@@ -45,7 +45,7 @@ make uninstall
 secondary terminal-agent mode (`brew install tmux`).
 
 ```bash
-make check                # 172 unit tests + 12 tmux end-to-end + 37 containment
+make check                # 182 unit tests + 12 tmux end-to-end + 45 containment
 make help                 # list targets
 ```
 
@@ -208,7 +208,7 @@ the same shape macs-connect already uses for owner grants:
   "Payload": {
     "Domain": "dangerously-allow-native-gui-action/v1",
     "Purpose": "native-gui-approve",
-    "Host": "hyde-m6-2.local",
+    "Host": "hyde-m6-2",
     "Task_Id": "…", "Session_Id": "…", "Request_Id": "…",
     "App_Bundle_Id": "com.openai.codex",
     "App_Team_Id": "2DC432GLL2",
@@ -236,6 +236,14 @@ authorised press does.
 compared to narrow what a signature may authorise, and a capability with the
 right task but no valid signature authorises nothing. No task id, session id,
 environment variable or CLI flag makes the channel click-capable on its own.
+
+`Host` defaults to the machine's **stable local name**, not
+`ProcessInfo.hostName`: the first DNS label, lowercased, so `hyde-m6-2.local`,
+`hyde-m6-2.tail6f7ef3.ts.net` and `hyde-m6-2` are one identity. The resolver
+prefers `SCDynamicStoreCopyLocalHostName`, then the computer name, then the BSD
+hostname, and requires a DNS-label-shaped result; if none is usable the host is
+empty and both the capability gate and the card ledger refuse. An explicit
+`--host` wins verbatim and must match the issuer's value.
 
 ### There is no issuer, and none was added
 
@@ -329,6 +337,17 @@ buttons. `notifications` watches for banners that offer an Allow-style action,
 but it is observe-only: the poster cannot be attested from the banner, so the
 containment gate declines to press even with a capability.
 
+```bash
+dangerously-allow notifications --dry-run     # see what it would press
+dangerously-allow notifications               # observe only
+```
+
+A banner with no grant action — your average "meeting in 5 minutes" — offers
+nothing to press and is never touched. Both need the terminal to have
+Accessibility permission (System Settings → Privacy & Security →
+Accessibility); neither needs sudo. If a card's wording is not recognised, run
+with `--dump` to print the pruned AX tree and paste it into an issue.
+
 ### One physical press per card
 
 A card has no nonce, so operation-level dedup is not enough. A04 showed the
@@ -339,11 +358,19 @@ another watcher process or a restart all used to look like a new card.
 
 Every card press now takes a durable claim first, keyed on:
 
-* the host the watcher runs on,
+* the host the watcher runs on, canonicalised to its stable first DNS label so
+  `*.local`, tailnet and single-label spellings of one machine are one
+  identity,
 * the app's live signed identity (bundle id and team id),
 * a window identity that survives rescans of the same window
   (`AXIdentifier`, else role + title, else the window's ordinal), and
 * the card's prompt fingerprint (option labels plus card text).
+
+A04's follow-up found the default host spelling was itself unstable:
+`ProcessInfo.hostName` returned `hyde-m6-2`, `hyde-m6-2.local` and
+`hyde-m6-2.tail6f7ef3.ts.net` on one machine. The ledger therefore keys on the
+canonical first DNS label of the stable local name, so a `.local` or tailnet
+name change cannot re-key a card; an explicit `--host` still wins verbatim.
 
 One claim is one physical press. A re-presented identical card is refused with
 `duplicate_card_press` — a distinct code — and left for a human. A genuinely new
@@ -359,18 +386,6 @@ with no acceptable option never burns it.
 same guard and prints the decision without touching an Accessibility tree or
 pressing anything; `tools/containment-test.sh` uses it to prove one-winner
 semantics across eight concurrent processes.
-
-
-```bash
-dangerously-allow notifications --dry-run     # see what it would press
-dangerously-allow notifications               # observe only
-```
-
-A banner with no grant action — your average "meeting in 5 minutes" — offers
-nothing to press and is never touched. Both need the terminal to have
-Accessibility permission (System Settings → Privacy & Security →
-Accessibility); neither needs sudo. If a card's wording is not recognised, run
-with `--dump` to print the pruned AX tree and paste it into an issue.
 
 ## Sweeping without stalling
 
@@ -532,6 +547,7 @@ Sources/DangerouslyAllowCore/    pure logic, no I/O — where the tests live
   DesktopRouter.swift            which detector owns a window; the watched apps
   NativeGuiContainment.swift     pinned identities, capability gate, one-use ledger
   CardPressLedger.swift          one-shot card identity claims (press-level dedup)
+  HostIdentity.swift             canonical host labels; one identity per machine
 Sources/DangerouslyAllow/
   AXTree.swift                   the only file that touches AXUIElement
   DesktopWatcher.swift           the default mode: all three channels, one loop
@@ -540,6 +556,7 @@ Sources/DangerouslyAllow/
   NativeGuiGate.swift            code-signature probe, capability loading, ledger
   ContainmentOptions.swift       containment flags, status and check output
   CardPressStore.swift           durable `O_CREAT|O_EXCL` card claim ledger
+  HostEnvironment.swift          stable local host resolution (not reverse DNS)
   TmuxChannel.swift              capture-pane / send-keys
   Watcher.swift                  closed-loop poll -> navigate -> confirm
   Runner.swift                   `run`: start the agent in tmux, spawn the watcher
@@ -563,9 +580,9 @@ and paste the parsed menu into an issue along with the raw
 `tmux capture-pane -p -t <session>` output. New harnesses are usually just a few
 labels in `OptionClassifier` plus a fixture in `RealCaptureTests`.
 
-`make check` must stay green: 172 unit tests (run through the local XCTest shim
+`make check` must stay green: 182 unit tests (run through the local XCTest shim
 on the CLT-only fleet), 12 end-to-end tests that drive a mock TUI through a real
-tmux pane, and 37 executable-level containment checks. Until a host with Xcode
+tmux pane, and 45 executable-level containment checks. Until a host with Xcode
 exists, `swift test` itself cannot resolve XCTest and is expected to fail; that
 limitation is a test-host fact, not a product failure.
 

@@ -10,7 +10,7 @@ struct ContainmentOptions {
     var trustedIssuerSHA256: [String] = []
     var taskID = ""
     var sessionID = ""
-    var host = ProcessInfo.processInfo.hostName
+    var host = HostEnvironment.resolvedHost()
     var replayDirectory = FileNativeGuiReplayLedger.defaultDirectory()
     var policy: AllowPolicy = .once
     var neverApprove: [String] = []

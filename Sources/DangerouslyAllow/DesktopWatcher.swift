@@ -24,7 +24,7 @@ struct DesktopOptions {
     /// Nil only for tests that build options directly.
     var cardLedger: CardPressClaimRecording?
     /// Host the claim is bound to; part of the card identity.
-    var host = ProcessInfo.processInfo.hostName
+    var host = HostEnvironment.resolvedHost()
 }
 
 /// The whole desktop surface in one process: the approval cards the ChatGPT and

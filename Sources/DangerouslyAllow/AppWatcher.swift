@@ -31,7 +31,7 @@ struct AppWatchOptions {
     /// processes and restarts. Nil only in tests that build options directly.
     var cardLedger: CardPressClaimRecording?
     /// Host the claim is bound to; part of the card identity.
-    var host = ProcessInfo.processInfo.hostName
+    var host = HostEnvironment.resolvedHost()
     var probe: AppIdentityProbing = CodeSigningIdentityProbe()
 }
 
