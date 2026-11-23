@@ -234,6 +234,76 @@ for pair in "ChatGPT|com.openai.codex|2DC432GLL2" "T3 Code|com.t3tools.t3code|AR
     fi
 done
 
+# ---- a card presentation is claimed exactly once ------------------------
+# A04: two presentations of one approval card produced two physical presses.
+# The executable claims a card by host + signed app + window + prompt before it
+# presses; a second claim is the distinct duplicate_card_press denial.
+echo "card press ledger"
+CARD="$TMP/card-ledger"
+CARD_ARGS=(app com.openai.codex --card-claim-check --host "$HOST"
+    --card-window "ax-id:chatgpt-approval-window" --card-prompt "Allow|Deny§Run the tests"
+    --card-store "$CARD")
+CARD_FIRST="$("$BIN" "${CARD_ARGS[@]}")"
+check "a new card presentation is claimed" "true" "$(printf '%s' "$CARD_FIRST" | json Claimed)"
+check "the claim binds the pinned app" "com.openai.codex" \
+    "$(printf '%s' "$CARD_FIRST" | json App_Bundle_Id)"
+check "the claim binds the pinned team" "2DC432GLL2" \
+    "$(printf '%s' "$CARD_FIRST" | json App_Team_Id)"
+CARD_SECOND="$("$BIN" "${CARD_ARGS[@]}")"
+check "the same card is never claimed twice" "false" \
+    "$(printf '%s' "$CARD_SECOND" | json Claimed)"
+check "the duplicate has its own denial code" "duplicate_card_press" \
+    "$(printf '%s' "$CARD_SECOND" | json Reason)"
+
+# A separate process reading the same store is a replay after a watcher
+# restart: the claim is durable, not in-memory.
+CARD_RESTART="$("$BIN" "${CARD_ARGS[@]}")"
+check "a replay after claim survives a process restart" "duplicate_card_press" \
+    "$(printf '%s' "$CARD_RESTART" | json Reason)"
+
+# A genuinely new card is still pressable.
+CARD_NEW_PROMPT="$("$BIN" app com.openai.codex --card-claim-check --host "$HOST" \
+    --card-window "ax-id:chatgpt-approval-window" --card-prompt "Allow|Deny§Run a different command" \
+    --card-store "$CARD")"
+check "a genuinely new card is still claimed" "true" \
+    "$(printf '%s' "$CARD_NEW_PROMPT" | json Claimed)"
+CARD_NEW_WINDOW="$("$BIN" app com.openai.codex --card-claim-check --host "$HOST" \
+    --card-window "ax-id:chatgpt-second-window" --card-prompt "Allow|Deny§Run the tests" \
+    --card-store "$CARD")"
+check "a new window with the same wording is claimed" "true" \
+    "$(printf '%s' "$CARD_NEW_WINDOW" | json Claimed)"
+CARD_OTHER_APP="$("$BIN" app com.t3tools.t3code --card-claim-check --host "$HOST" \
+    --card-window "ax-id:chatgpt-approval-window" --card-prompt "Allow|Deny§Run the tests" \
+    --card-store "$CARD")"
+check "another pinned app is claimed separately" "true" \
+    "$(printf '%s' "$CARD_OTHER_APP" | json Claimed)"
+CARD_OTHER_HOST="$("$BIN" app com.openai.codex --card-claim-check --host "some-other-host" \
+    --card-window "ax-id:chatgpt-approval-window" --card-prompt "Allow|Deny§Run the tests" \
+    --card-store "$CARD")"
+check "another host is claimed separately" "true" \
+    "$(printf '%s' "$CARD_OTHER_HOST" | json Claimed)"
+
+# An identity with no window cannot be allowed to collapse every card in the
+# app onto one entry, so it is refused before the store is touched.
+CARD_INCOMPLETE="$("$BIN" app com.openai.codex --card-claim-check --host "$HOST" \
+    --card-window "" --card-prompt "Allow|Deny§Run the tests" --card-store "$TMP/card-incomplete")"
+check "an unidentifiable card is refused" "incomplete_card_identity" \
+    "$(printf '%s' "$CARD_INCOMPLETE" | json Reason)"
+
+# Concurrent claimers: exactly one may win, or two processes would each press.
+CONTEND="$TMP/card-contend"
+for i in 1 2 3 4 5 6 7 8; do
+    "$BIN" app com.openai.codex --card-claim-check --host "$HOST" \
+        --card-window "ax-id:contended-window" --card-prompt "Allow|Deny§contended card" \
+        --card-store "$CONTEND" >"$TMP/claim-$i.json" 2>/dev/null &
+done
+wait
+winners=0
+for f in "$TMP"/claim-*.json; do
+    [[ "$(json Claimed <"$f")" == "true" ]] && winners=$((winners + 1))
+done
+check "concurrent claimers produce exactly one press claim" "1" "$winners"
+
 # ---- a pin must not be confused with the shipped requirement hash -------
 case "$CHATGPT_REQ" in
     [0-9a-f][0-9a-f][0-9a-f]*) echo "  ✓ the ChatGPT pin resolves to a SHA-256"; pass=$((pass + 1)) ;;

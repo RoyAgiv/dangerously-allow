@@ -20,6 +20,11 @@ struct DesktopOptions {
     /// The native-GUI containment gate. Nil is treated as "no capability", so
     /// a missing gate can only ever observe — it can never press.
     var gate: NativeGuiGate?
+    /// Durable one-shot claim on a card presentation, shared with `app` mode.
+    /// Nil only for tests that build options directly.
+    var cardLedger: CardPressClaimRecording?
+    /// Host the claim is bound to; part of the card identity.
+    var host = ProcessInfo.processInfo.hostName
 }
 
 /// The whole desktop surface in one process: the approval cards the ChatGPT and
@@ -88,6 +93,11 @@ final class DesktopWatcher {
         /// Native dialogs only: true when `SystemDialogDetector` recognised the
         /// wording. The containment gate refuses an unrecognised prompt.
         let triggerRecognized: Bool
+        /// The app whose window carries the prompt, and which window it is —
+        /// the durable card ledger's identity material.
+        let appBundleID: String
+        let appTeamID: String
+        let windowIdentity: String
     }
 
     func run() {
@@ -150,13 +160,18 @@ final class DesktopWatcher {
                         + String(format: "%.1f", cost) + "s")
                 }
             }
-            let cardsAllowed = AgentApps.isWatched(
+            let watched = AgentApps.isWatched(
                 name: app.localizedName, bundleID: app.bundleIdentifier, in: opts.apps
-            ) && isPinnedApp(app)
+            )
+            // Only probe the signature for an app we were asked to answer cards
+            // in: a Security-framework round trip per running app per sweep is
+            // not free, and only a watched app can reach the card path.
+            let liveIdentity = watched ? probe.identity(forPID: app.processIdentifier) : nil
+            let cardsAllowed = watched && liveIdentity?.satisfiesPinnedRequirement == true
             let appDeadline = Date(
                 timeIntervalSinceNow: cardsAllowed ? Self.perCardAppWalk : Self.perAppWalk
             )
-            for window in tree.windows(ofPID: app.processIdentifier) {
+            for (index, window) in tree.windows(ofPID: app.processIdentifier).enumerated() {
                 // Windows come front-to-back, so a prompt is at the top of the
                 // list; the tail is what runs the clock down.
                 if Date() >= appDeadline { break }
@@ -173,7 +188,11 @@ final class DesktopWatcher {
                 ) else { continue }
                 if tree.truncated, !cardsAllowed { continue }
                 guard let answer = answer(
-                    for: root, cardsAllowed: cardsAllowed
+                    for: root,
+                    cardsAllowed: cardsAllowed,
+                    appBundleID: liveIdentity?.bundleID ?? app.bundleIdentifier ?? "",
+                    appTeamID: liveIdentity?.teamID ?? "",
+                    windowIdentity: tree.windowIdentity(window, index: index)
                 ) else { continue }
 
                 seen.insert(answer.fingerprint)
@@ -189,7 +208,13 @@ final class DesktopWatcher {
         return pressed
     }
 
-    private func answer(for window: UINode, cardsAllowed: Bool) -> Answer? {
+    private func answer(
+        for window: UINode,
+        cardsAllowed: Bool,
+        appBundleID: String,
+        appTeamID: String,
+        windowIdentity: String
+    ) -> Answer? {
         switch DesktopRouter.route(
             window: window,
             cardsAllowed: cardsAllowed,
@@ -205,7 +230,10 @@ final class DesktopWatcher {
                 options: d.options.map { ($0.label, $0.kind) },
                 target: d.target.map { ($0.id, $0.label, $0.kind) },
                 policy: opts.policies.dialog,
-                triggerRecognized: SystemDialogDetector.hasRecognizedTrigger(d.fullText)
+                triggerRecognized: SystemDialogDetector.hasRecognizedTrigger(d.fullText),
+                appBundleID: appBundleID,
+                appTeamID: appTeamID,
+                windowIdentity: windowIdentity
             )
         case let .card(c):
             return Answer(
@@ -216,7 +244,10 @@ final class DesktopWatcher {
                 options: c.options.map { ($0.label, $0.kind) },
                 target: c.target.map { ($0.id, $0.label, $0.kind) },
                 policy: opts.policies.card,
-                triggerRecognized: true
+                triggerRecognized: true,
+                appBundleID: appBundleID,
+                appTeamID: appTeamID,
+                windowIdentity: windowIdentity
             )
         case .ignored:
             return nil
@@ -256,6 +287,33 @@ final class DesktopWatcher {
             return false
         }
 
+        // Press-level dedup for in-app cards: the same card re-presented from a
+        // second window, by another watcher or after a restart is refused here.
+        // Native dialogs have their own one-use capability nonce instead.
+        if answer.channel == "card", let ledger = opts.cardLedger {
+            let identity = CardPressIdentity(
+                host: opts.host,
+                appBundleID: answer.appBundleID,
+                appTeamID: answer.appTeamID,
+                windowIdentity: answer.windowIdentity,
+                promptFingerprint: answer.fingerprint
+            )
+            switch CardPressGuard.claim(identity, ledger: ledger) {
+            case let .press(claimed):
+                Log.info("  card claim \(claimed.ledgerKey.prefix(12))… is the first "
+                    + "for this presentation")
+            case .duplicate:
+                Log.warn("  observe-only — duplicate_card_press: this card was already "
+                    + "claimed (same host, app, window and prompt); leaving it for a human")
+                if opts.notify { Notify.post("Duplicate card in \(appName) left for a human") }
+                return false
+            case let .refused(refusal):
+                Log.warn("  observe-only — card press refused (\(refusal.rawValue))")
+                if opts.notify { Notify.post("Card in \(appName) left for a human") }
+                return false
+            }
+        }
+
         // The native-GUI channel may not press until the containment gate
         // returns an authorisation. A dry run returns above, so it never
         // consumes a capability's nonce.
@@ -287,12 +345,5 @@ final class DesktopWatcher {
         }
         Log.error("  press failed (AXError \(err.rawValue))")
         return false
-    }
-
-    /// An app's cards are only pressable when its live code signature satisfies
-    /// the pinned designated requirement. The name is not enough: an unsigned
-    /// bundle can call itself "ChatGPT".
-    private func isPinnedApp(_ app: NSRunningApplication) -> Bool {
-        probe.identity(forPID: app.processIdentifier)?.satisfiesPinnedRequirement == true
     }
 }
