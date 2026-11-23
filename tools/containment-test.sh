@@ -220,6 +220,20 @@ else
     echo "  ✓ 'app Claude' fails closed (not pinned)"; pass=$((pass + 1))
 fi
 
+# ---- the two approved apps are still accepted for their cards -----------
+for pair in "ChatGPT|com.openai.codex|2DC432GLL2" "T3 Code|com.t3tools.t3code|ARK85ZXQ4Z"; do
+    IFS='|' read -r label bundle team <<< "$pair"
+    ACCEPT_LOG="$TMP/accept-$bundle.log"
+    "$BIN" app "$bundle" --dump >"$ACCEPT_LOG" 2>&1 &
+    pid=$!; sleep 1.2; kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    if grep -q "pinned identity: $label $bundle, team $team" "$ACCEPT_LOG"; then
+        echo "  ✓ '$label' is accepted and pinned ($bundle)"; pass=$((pass + 1))
+    else
+        echo "  ✗ '$label' is accepted and pinned ($bundle)"
+        sed 's/^/      /' "$ACCEPT_LOG"; fail=$((fail + 1))
+    fi
+done
+
 # ---- a pin must not be confused with the shipped requirement hash -------
 case "$CHATGPT_REQ" in
     [0-9a-f][0-9a-f][0-9a-f]*) echo "  ✓ the ChatGPT pin resolves to a SHA-256"; pass=$((pass + 1)) ;;
