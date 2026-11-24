@@ -67,6 +67,19 @@ CONTAINMENT (native permission dialogs and notification banners)
   the pinned issuer fingerprint, the expiry and the one-use nonce are what
   authorise a press.
 
+OWNER CONSENT (explicit opt-in for unattended consent dialogs)
+  --owner-consent <file>          answer real macOS consent dialogs under an
+                                  owner-authored authorization file. The file
+                                  must be mode 0600, owned by this user, and say
+                                  {"Schema":"hyde-owner-consent/v1","Enabled":true}.
+                                  Allow_Permanent:true also authorises permanent
+                                  grants ("Allow" on a TCC dialog). Refusals,
+                                  "Open System Settings", passwords, Keychain,
+                                  Touch ID, FileVault, Apple Account, sudo and
+                                  administrator authentication stay unpressable.
+                                  Each decision is appended to
+                                  ~/.local/state/hyde-approval-watchers/consent-audit.jsonl
+
 ONE CHANNEL AT A TIME
   dangerously-allow gui [options]                 native macOS permission dialogs
   dangerously-allow app <name> [options]          approval cards in one app
@@ -367,6 +380,14 @@ struct CLI {
             case "--never-approve": opts.neverApprove.append(take(args, &i, "--never-approve"))
             case "--poll": opts.pollInterval = (Double(take(args, &i, "--poll")) ?? 500) / 1000
             case "--notify": opts.notify = true
+            case "--owner-consent":
+                let path = take(args, &i, "--owner-consent")
+                do {
+                    opts.ownerConsent = try OwnerConsent.load(path: path)
+                } catch {
+                    Log.error("\(error)")
+                    exit(2)
+                }
             default:
                 Log.error("unknown option '\(args[i])'")
                 exit(2)

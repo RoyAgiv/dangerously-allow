@@ -262,6 +262,57 @@ installed app's live signature and prints the decision; it consumes the nonce on
 success and presses nothing. `tools/containment-test.sh` mints throwaway test
 keys and drives both, without opening a consent dialog or touching TCC.
 
+## Owner consent: unattended fleet approval
+
+The capability path above is per-press and needs an issuer, so it cannot answer
+a prompt that appears while nobody is present. An owner who accepts that
+trade-off can instead authorise the channel with a file:
+
+```json
+{
+  "Schema": "hyde-owner-consent/v1",
+  "Enabled": true,
+  "Allow_Permanent": true,
+  "Never_Approve": ["(?i)(sudo|password|keychain|filevault)"]
+}
+```
+
+```bash
+chmod 600 ~/.config/hyde/owner-consent.json
+dangerously-allow gui --policy always \
+  --owner-consent ~/.config/hyde/owner-consent.json \
+  --never-approve '(?i)(sudo|password|keychain|touch[ -]?id|filevault)' \
+  --poll 1000 --notify
+```
+
+The file must be owned by the executing user and must not be group- or
+world-writable. A command-line flag alone never enables the mode: without a
+valid file the channel behaves exactly as documented above. `Allow_Permanent`
+is required for a plain TCC `Allow` (a permanent grant); without it only
+bounded one-shot buttons are eligible.
+
+This path still refuses, in order:
+
+- every denial or neutral button (`Don't Allow`, `Cancel`, `Open System
+  Settings`), structurally — they appear in no policy preference list;
+- password, passphrase, Keychain, Touch ID, FileVault, Apple Account, sudo and
+  administrator-authentication prompts (`OwnerConsent.hardBlock`, which no
+  file or flag can remove);
+- an arbitrary app window. A dialog qualifies only when the window belongs to a
+  system consent host (`UserNotificationCenter`, `tccd`, …), or carries
+  recognised consent wording *and* offers a refusal/neutral way out. An app's
+  "The document could not be opened — OK" alert is not a consent surface.
+
+Every decision is appended to
+`~/.local/state/hyde-approval-watchers/consent-audit.jsonl` with a prompt
+fingerprint digest, the pressed label and whether a system permission changed.
+No prompt body is stored.
+
+The macOS Accessibility grant is still a real owner action. Once granted to the
+executing process (or to the LaunchAgent's `node` responsible process),
+`AXIsProcessTrusted() = true` is printed at startup and the supervisor heartbeat
+records `Accessibility: available`.
+
 ## Approval cards, and notification banners
 
 The ChatGPT desktop app (`com.openai.codex`) and T3 (`com.t3tools.t3code`) ask

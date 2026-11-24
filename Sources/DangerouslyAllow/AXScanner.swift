@@ -24,6 +24,13 @@ struct GuiWatchOptions {
     /// Native-GUI containment. Nil is treated as "no capability", so it can
     /// only observe.
     var gate: NativeGuiGate?
+    /// Explicit owner authorization to answer consent dialogs without a
+    /// per-press capability. Nil (the default) keeps the capability gate as
+    /// the only press path.
+    var ownerConsent: OwnerConsent?
+    /// The host recorded in the consent audit trail.
+    var host: String = ProcessInfo.processInfo.hostName
+    var consentAudit: OwnerConsentAudit? = OwnerConsentAudit(directory: OwnerConsentAudit.defaultDirectory())
 }
 
 /// Auto-clicks native macOS TCC dialogs (Microphone, Screen Recording,
@@ -42,15 +49,25 @@ enum AXScanner {
         Log.info("scanning for macOS permission dialogs\(options.dryRun ? "  (DRY RUN)" : "")")
         Log.info("policy: \(options.policy.rawValue)  poll: \(options.pollInterval)s — Ctrl+C to stop")
         Log.info("native dialogs: \(options.gate?.summary ?? "observe-only — no gate")")
-        Log.info("a TCC grant is permanent — a plain \"Allow\" is never pressed; a press")
-        Log.info("  needs an explicit one-shot button plus a valid one-use capability")
+        if options.ownerConsent == nil {
+            Log.info("a TCC grant is permanent — a plain \"Allow\" is never pressed; a press")
+            Log.info("  needs an explicit one-shot button plus a valid one-use capability")
+        }
         if !options.neverApprove.isEmpty {
             Log.info("never-approve: \(options.neverApprove.joined(separator: ", "))")
+        }
+        if let consent = options.ownerConsent {
+            Log.info("owner consent: \(consent.path) "
+                + "(permanent grants \(consent.allowPermanent ? "allowed" : "refused"))")
         }
 
         AXTree.capMessagingTimeout()
         if !AXIsProcessTrusted() {
             Log.warn("AXIsProcessTrusted() = false — re-run with sudo, or grant Accessibility")
+        } else {
+            // Positive capability evidence for the supervising heartbeat. It
+            // is only printed from a context that can actually read windows.
+            Log.info("AXIsProcessTrusted() = true")
         }
 
         let scanner = Scan(options: options)
@@ -211,6 +228,12 @@ enum AXScanner {
                 return false
             }
 
+            if let consent = opts.ownerConsent {
+                return pressUnderOwnerConsent(
+                    consent, dialog: dialog, target: target, appName: appName, pid: pid
+                )
+            }
+
             // The single native-GUI press path. A dry run returns above, so it
             // never consumes a capability's nonce.
             let decision = opts.gate?.authorize(
@@ -239,6 +262,78 @@ enum AXScanner {
             }
             Log.error("  press failed (AXError \(err.rawValue))")
             return false
+        }
+
+        /// Owner-consent path. The file is the authorization; the hard block
+        /// and the operator's veto list still apply, and the dialog must be a
+        /// real consent surface rather than an arbitrary small window.
+        private func pressUnderOwnerConsent(
+            _ consent: OwnerConsent,
+            dialog: DetectedSystemDialog,
+            target: SystemDialogOption,
+            appName: String,
+            pid: pid_t
+        ) -> Bool {
+            let bundleID = CodeSigningIdentityProbe().identity(forPID: pid)?.bundleID
+            let triggerRecognized = SystemDialogDetector.hasRecognizedTrigger(dialog.fullText)
+            guard OwnerConsent.isConsentDialog(
+                dialog: dialog, bundleID: bundleID, triggerRecognized: triggerRecognized
+            ) else {
+                Log.warn("  owner consent declined — window of \(appName) is not a consent surface")
+                return false
+            }
+            if let blocked = PromptDetector.blockingPattern(
+                screen: dialog.fullText,
+                neverApprove: consent.vetoPatterns(operatorPatterns: opts.neverApprove)
+            ) {
+                Log.warn("REFUSING — owner-consent hard block /\(blocked)/")
+                Log.warn("  leaving for a human: \(dialog.dialogText.prefix(140))")
+                if opts.notify { Notify.post("Owner consent vetoed a prompt in \(appName)") }
+                opts.consentAudit?.record(
+                    app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                    target: target.label, kind: target.kind.rawValue, host: opts.host,
+                    outcome: "vetoed"
+                )
+                return false
+            }
+            if target.kind == .allowAlways && !consent.allowPermanent {
+                Log.warn("  owner consent allows one-shot grants only — leaving permanent grant")
+                if opts.notify { Notify.post("Permanent grant in \(appName) needs the owner") }
+                opts.consentAudit?.record(
+                    app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                    target: target.label, kind: target.kind.rawValue, host: opts.host,
+                    outcome: "permanent_not_authorized"
+                )
+                return false
+            }
+
+            Log.info("  owner consent authorises this press (\(consent.path))")
+            let audit = opts.consentAudit
+            guard let err = tree.press(target.id) else {
+                Log.error("  lost the button between scan and press — leaving it")
+                audit?.record(
+                    app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                    target: target.label, kind: target.kind.rawValue, host: opts.host,
+                    outcome: "press_lost"
+                )
+                return false
+            }
+            guard err == .success else {
+                Log.error("  press failed (AXError \(err.rawValue))")
+                audit?.record(
+                    app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                    target: target.label, kind: target.kind.rawValue, host: opts.host,
+                    outcome: "press_failed"
+                )
+                return false
+            }
+            Log.info("  pressed \"\(target.label)\" under owner consent")
+            audit?.record(
+                app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                target: target.label, kind: target.kind.rawValue, host: opts.host,
+                outcome: "pressed"
+            )
+            return true
         }
 
         // MARK: - diagnostics

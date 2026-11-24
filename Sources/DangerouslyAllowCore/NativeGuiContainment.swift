@@ -89,9 +89,14 @@ public enum NativeGuiContainment {
             $0.bundleID.lowercased() == needle || $0.displayName.lowercased() == needle
         }
         if exact.count == 1 { return exact[0] }
+        // The installed app's localized name may carry a channel suffix
+        // ("T3 Code (Nightly)"), so a needle that contains the pinned display
+        // name is accepted too. The live code signature is still what authorises
+        // the press; this only resolves which pinned identity to check against.
         let partial = approvedApps.filter {
             $0.bundleID.lowercased().contains(needle)
                 || $0.displayName.lowercased().contains(needle)
+                || needle.contains($0.displayName.lowercased())
         }
         return partial.count == 1 ? partial[0] : nil
     }
