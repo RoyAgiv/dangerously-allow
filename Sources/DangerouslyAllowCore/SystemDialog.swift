@@ -16,6 +16,9 @@ public struct SystemDialogOption: Equatable {
 public struct DetectedSystemDialog {
     /// Every labelled button on the dialog, in tree order.
     public let options: [SystemDialogOption]
+    /// Text fields on the dialog, in tree order. A password prompt carries one;
+    /// a plain consent dialog carries none.
+    public let fields: [Int]
     /// The button the policy allows pressing. nil = this is a real permission
     /// dialog, but nothing on it is acceptable — leave it for a human.
     public let target: SystemDialogOption?
@@ -25,6 +28,22 @@ public struct DetectedSystemDialog {
     public let fullText: String
     /// Stable across rescans of the same dialog; ids are deliberately excluded.
     public let fingerprint: String
+
+    public init(
+        options: [SystemDialogOption],
+        fields: [Int] = [],
+        target: SystemDialogOption?,
+        dialogText: String,
+        fullText: String,
+        fingerprint: String
+    ) {
+        self.options = options
+        self.fields = fields
+        self.target = target
+        self.dialogText = dialogText
+        self.fullText = fullText
+        self.fingerprint = fingerprint
+    }
 }
 
 /// Why a window was passed over. Surfaced by `--verbose` so an unrecognised
@@ -125,7 +144,8 @@ public enum SystemDialogDetector {
     ) -> SystemDialogScan {
         var buttons: [UINode] = []
         var texts: [String] = []
-        collect(root, buttons: &buttons, texts: &texts)
+        var fields: [Int] = []
+        collect(root, buttons: &buttons, texts: &texts, fields: &fields)
 
         let labelled = buttons.filter { !$0.label.isEmpty }
         guard !labelled.isEmpty, labelled.count <= maxOptions else {
@@ -158,6 +178,7 @@ public enum SystemDialogDetector {
         return .dialog(
             DetectedSystemDialog(
                 options: options,
+                fields: fields,
                 target: target,
                 dialogText: dialogText,
                 fullText: dialogText + " " + labels.joined(separator: " "),
@@ -168,7 +189,9 @@ public enum SystemDialogDetector {
 
     /// Buttons are leaves — their wording belongs to the option, not to the
     /// dialog, so `--never-approve` can tell the two apart.
-    private static func collect(_ node: UINode, buttons: inout [UINode], texts: inout [String]) {
+    private static func collect(
+        _ node: UINode, buttons: inout [UINode], texts: inout [String], fields: inout [Int]
+    ) {
         // Original browser windows remain scan candidates after native dialog
         // discovery. A toolbar-free popup is still a web document, not a TCC
         // dialog, even when its wording and button count happen to match.
@@ -177,8 +200,13 @@ public enum SystemDialogDetector {
             buttons.append(node)
             return
         }
+        if node.role == "AXTextField" || node.role == "AXSecureTextField" {
+            fields.append(node.id)
+        }
         if !node.label.isEmpty { texts.append(node.label) }
         if !node.text.isEmpty { texts.append(node.text) }
-        for child in node.children { collect(child, buttons: &buttons, texts: &texts) }
+        for child in node.children {
+            collect(child, buttons: &buttons, texts: &texts, fields: &fields)
+        }
     }
 }

@@ -273,7 +273,11 @@ trade-off can instead authorise the channel with a file:
   "Schema": "hyde-owner-consent/v1",
   "Enabled": true,
   "Allow_Permanent": true,
-  "Never_Approve": ["(?i)(sudo|password|keychain|filevault)"]
+  "Allow_Authentication": true,
+  "Allow_Any_Dialog": true,
+  "Allow_Destructive": false,
+  "Secret_Command": ["/opt/homebrew/bin/node", "/Users/you/.local/bin/Agent_Secrets.mjs",
+    "exec", "--keys", "MACOS_LOGIN", "--", "/bin/cat"]
 }
 ```
 
@@ -291,17 +295,21 @@ valid file the channel behaves exactly as documented above. `Allow_Permanent`
 is required for a plain TCC `Allow` (a permanent grant); without it only
 bounded one-shot buttons are eligible.
 
-This path still refuses, in order:
+With `Allow_Authentication: true` this path also answers password, Keychain,
+Touch ID-sheet, FileVault, Apple Account, sudo and administrator-authentication
+prompts, and `Allow_Any_Dialog: true` accepts any dialog-shaped window. A dialog
+with a text field is filled from `Secret_Command` before the grant button is
+pressed; the value is never logged. macOS secure-event input may still reject
+synthetic text in the most protected SecurityAgent fields, and Touch ID itself
+cannot be automated.
+
+This path still refuses, structurally:
 
 - every denial or neutral button (`Don't Allow`, `Cancel`, `Open System
-  Settings`), structurally — they appear in no policy preference list;
-- password, passphrase, Keychain, Touch ID, FileVault, Apple Account, sudo and
-  administrator-authentication prompts (`OwnerConsent.hardBlock`, which no
-  file or flag can remove);
-- an arbitrary app window. A dialog qualifies only when the window belongs to a
-  system consent host (`UserNotificationCenter`, `tccd`, …), or carries
-  recognised consent wording *and* offers a refusal/neutral way out. An app's
-  "The document could not be opened — OK" alert is not a consent surface.
+  Settings`) — they appear in no policy preference list;
+- irreversible destructive confirmations (`Erase All Content and Settings`,
+  delete/format/factory reset/reboot) unless `Allow_Destructive` is true;
+- any window with no granting button at all.
 
 Every decision is appended to
 `~/.local/state/hyde-approval-watchers/consent-audit.jsonl` with a prompt

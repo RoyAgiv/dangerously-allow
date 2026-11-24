@@ -18,6 +18,8 @@ final class AXTree {
     }
 
     private(set) var pressables: [Int: Pressable] = [:]
+    /// Text fields handed out an id, for a password prompt that needs a value.
+    private(set) var textFields: [Int: AXUIElement] = [:]
     /// True when the walk ran out of budget — the tree is a fragment, and a
     /// fragment is only safe to reason about if you wanted the whole thing.
     private(set) var truncated = false
@@ -57,6 +59,7 @@ final class AXTree {
     /// nodes can stall the sweep for minutes. Time is the honest unit.
     func build(_ element: AXUIElement, budget: Int = maxNodes, within: TimeInterval) -> UINode? {
         pressables.removeAll()
+        textFields.removeAll()
         truncated = false
         nextID = 0
         self.budget = budget
@@ -65,6 +68,39 @@ final class AXTree {
     }
 
     func isPressable(_ id: Int) -> Bool { pressables[id] != nil }
+
+    /// Put `text` into a field from the current tree. Secure password fields
+    /// normally refuse a direct value write and are protected by secure event
+    /// input, so this tries the value attribute, then focused Unicode events,
+    /// and reports whether either path was accepted. The caller logs the
+    /// outcome; the secret itself is never logged.
+    func typeInto(_ id: Int, text: String, pid: pid_t) -> Bool {
+        guard let element = textFields[id], !text.isEmpty else { return false }
+        _ = AXUIElementSetAttributeValue(
+            element, kAXFocusedAttribute as CFString, kCFBooleanTrue
+        )
+        usleep(80_000)
+        if AXUIElementSetAttributeValue(
+            element, kAXValueAttribute as CFString, text as CFString
+        ) == .success {
+            return true
+        }
+        guard let source = CGEventSource(stateID: .combinedSessionState) else { return false }
+        var units = Array(text.utf16)
+        for index in units.indices {
+            var unit = units[index]
+            guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
+            else { continue }
+            down.keyboardSetUnicodeString(stringLength: 1, unicodeString: &unit)
+            up.keyboardSetUnicodeString(stringLength: 1, unicodeString: &unit)
+            down.postToPid(pid)
+            up.postToPid(pid)
+            usleep(8_000)
+        }
+        units.removeAll()
+        return true
+    }
 
     /// nil when the element is gone from the table — the tree moved on.
     func press(_ id: Int) -> AXError? {
@@ -150,6 +186,9 @@ final class AXTree {
             // it, and its inner text belongs to the option, not to the card.
             pressables[id] = .button(element)
             return UINode(id: id, role: role, label: label, text: text)
+        }
+        if role == (kAXTextFieldRole as String) || role == "AXSecureTextField" {
+            textFields[id] = element
         }
 
         var children: [UINode] = []

@@ -25,9 +25,15 @@ import Foundation
 public struct OwnerConsent: Equatable {
     public static let schema = "hyde-owner-consent/v1"
 
-    /// The prompt families no consent file may approve. These are genuine
-    /// authentication/secret prompts, not consent grants.
-    public static let hardBlock = #"(?i)(password|passphrase|keychain|credential|secret|private[ -]?key|touch[ -]?id|filevault|apple[ -]?id|sudo|administrat(?:or|ion)|authenticate|authoriz|unlock|erase|signing|system extension)"#
+    /// Authentication wording. Applied only when the owner has not set
+    /// `Allow_Authentication: true`; the fleet owner did.
+    public static let authenticationBlock = #"(?i)(password|passphrase|keychain|credential|secret|private[ -]?key|touch[ -]?id|filevault|apple[ -]?id|sudo|administrat(?:or|ion)|authenticate|authoriz|unlock|signing|system extension)"#
+
+    /// Irreversible actions. Kept unless `Allow_Destructive: true`. These are
+    /// not consent grants: pressing the grant button on "Erase All Content and
+    /// Settings" destroys the machine, and no unattended watcher should do it
+    /// by default.
+    public static let destructiveBlock = #"(?i)(erase all|erase (?:the |this )?(?:disk|volume|mac)|delete all|delete (?:the |this )?(?:disk|volume|account)|remove all|factory reset|reset all|format (?:the |this )?(?:disk|volume)|overwrite|shut ?down|reboot|restart now|log out now|sign out now)"#
 
     /// Windows owned by these processes are the system's own consent UI.
     public static let systemConsentHosts: Set<String> = [
@@ -43,12 +49,35 @@ public struct OwnerConsent: Equatable {
     public let path: String
     /// A TCC "Allow" is permanent. The owner either accepted that or not.
     public let allowPermanent: Bool
-    /// Extra owner patterns, applied on top of the hard block.
+    /// Password / Keychain / Touch ID / FileVault / Apple Account / sudo /
+    /// administrator prompts may be answered.
+    public let allowAuthentication: Bool
+    /// Irreversible destructive confirmations may be answered.
+    public let allowDestructive: Bool
+    /// Any dialog-shaped window may be answered, not only a system consent
+    /// surface or recognised permission wording.
+    public let allowAnyDialog: Bool
+    /// An optional command that prints a secret on stdout. When present it is
+    /// typed into a password field before the grant button is pressed.
+    public let secretCommand: [String]
+    /// Extra owner patterns, applied on top of the built-in blocks.
     public let neverApprove: [String]
 
-    public init(path: String, allowPermanent: Bool, neverApprove: [String]) {
+    public init(
+        path: String,
+        allowPermanent: Bool,
+        allowAuthentication: Bool = false,
+        allowDestructive: Bool = false,
+        allowAnyDialog: Bool = false,
+        secretCommand: [String] = [],
+        neverApprove: [String]
+    ) {
         self.path = path
         self.allowPermanent = allowPermanent
+        self.allowAuthentication = allowAuthentication
+        self.allowDestructive = allowDestructive
+        self.allowAnyDialog = allowAnyDialog
+        self.secretCommand = secretCommand
         self.neverApprove = neverApprove
     }
 
@@ -85,19 +114,64 @@ public struct OwnerConsent: Equatable {
             throw OwnerConsentError.notEnabled(path)
         }
         let permanent = object["Allow_Permanent"] as? Bool == true
+        let authentication = object["Allow_Authentication"] as? Bool == true
+        let destructive = object["Allow_Destructive"] as? Bool == true
+        let anyDialog = object["Allow_Any_Dialog"] as? Bool == true
         var patterns: [String] = []
         if let list = object["Never_Approve"] as? [String] {
             patterns = list.filter { !$0.isEmpty && $0.count <= 512 }
         }
-        return OwnerConsent(path: path, allowPermanent: permanent, neverApprove: patterns)
+        var command: [String] = []
+        if let list = object["Secret_Command"] as? [String] {
+            command = list.filter { !$0.isEmpty && $0.count <= 2048 }
+            if command.count != list.count { throw OwnerConsentError.malformed(path) }
+        }
+        return OwnerConsent(
+            path: path,
+            allowPermanent: permanent,
+            allowAuthentication: authentication,
+            allowDestructive: destructive,
+            allowAnyDialog: anyDialog,
+            secretCommand: command,
+            neverApprove: patterns
+        )
     }
 
     /// The effective veto list: the operator's command-line patterns, this
-    /// file's patterns and the unremovable authentication block.
+    /// file's patterns, and only the built-in blocks the owner did not lift.
+    /// The capability path's baseline list is deliberately not added here — it
+    /// would silently re-refuse every authentication prompt the owner enabled.
     public func vetoPatterns(operatorPatterns: [String]) -> [String] {
-        NativeGuiContainment.effectiveNeverApprove(
-            operatorPatterns + neverApprove + [OwnerConsent.hardBlock]
-        )
+        var patterns = operatorPatterns + neverApprove
+        if !allowAuthentication { patterns.append(OwnerConsent.authenticationBlock) }
+        if !allowDestructive { patterns.append(OwnerConsent.destructiveBlock) }
+        var seen = Set<String>()
+        return patterns.filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+
+    /// Run the configured secret command and return its single line of output.
+    /// A command that fails, hangs or prints nothing yields nil, and the caller
+    /// presses the grant button without a value. The secret is never logged,
+    /// stored or placed in the audit trail.
+    public func resolveSecret(timeout: TimeInterval = 5) -> String? {
+        guard let executable = secretCommand.first, !secretCommand.isEmpty else { return nil }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = Array(secretCommand.dropFirst())
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning && Date() < deadline { usleep(50_000) }
+        if process.isRunning {
+            process.terminate()
+            return nil
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let value = (String(data: data, encoding: .utf8) ?? "")
+            .trimmingCharacters(in: .newlines)
+        return value.isEmpty ? nil : value
     }
 
     /// A dialog may be answered only when it is a real consent surface. A
@@ -107,8 +181,10 @@ public struct OwnerConsent: Equatable {
     public static func isConsentDialog(
         dialog: DetectedSystemDialog,
         bundleID: String?,
-        triggerRecognized: Bool
+        triggerRecognized: Bool,
+        allowAny: Bool = false
     ) -> Bool {
+        if allowAny { return true }
         if let bundleID, systemConsentHosts.contains(bundleID) { return true }
         let hasRefusal = dialog.options.contains { !$0.kind.grantsAccess && $0.kind != .neutral }
         let hasNeutral = dialog.options.contains { $0.kind == .neutral }
@@ -158,6 +234,7 @@ public struct OwnerConsentAudit {
         kind: String,
         host: String,
         outcome: String,
+        passwordsUsed: Bool = false,
         now: Date = Date()
     ) {
         let manager = FileManager.default
@@ -177,7 +254,7 @@ public struct OwnerConsentAudit {
             "target": String(target.prefix(80)),
             "kind": kind,
             "outcome": outcome,
-            "passwords_used": false,
+            "passwords_used": passwordsUsed,
             "system_permission_changed": outcome == "pressed",
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),

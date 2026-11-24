@@ -198,9 +198,14 @@ enum AXScanner {
 
         /// Returns true when the dialog was confirmed.
         private func handle(_ dialog: DetectedSystemDialog, appName: String, pid: pid_t) -> Bool {
+            // Owner consent owns the veto list: it can lift the authentication
+            // block deliberately, so the capability path's baseline must not be
+            // layered on top of it.
+            let veto = opts.ownerConsent?.vetoPatterns(operatorPatterns: opts.neverApprove)
+                ?? NativeGuiContainment.effectiveNeverApprove(opts.neverApprove)
             if let blocked = PromptDetector.blockingPattern(
                 screen: dialog.fullText,
-                neverApprove: NativeGuiContainment.effectiveNeverApprove(opts.neverApprove)
+                neverApprove: veto
             ) {
                 Log.warn("REFUSING — dialog matches --never-approve /\(blocked)/")
                 Log.warn("  leaving for a human: \(dialog.dialogText.prefix(140))")
@@ -277,7 +282,8 @@ enum AXScanner {
             let bundleID = CodeSigningIdentityProbe().identity(forPID: pid)?.bundleID
             let triggerRecognized = SystemDialogDetector.hasRecognizedTrigger(dialog.fullText)
             guard OwnerConsent.isConsentDialog(
-                dialog: dialog, bundleID: bundleID, triggerRecognized: triggerRecognized
+                dialog: dialog, bundleID: bundleID, triggerRecognized: triggerRecognized,
+                allowAny: consent.allowAnyDialog
             ) else {
                 Log.warn("  owner consent declined — window of \(appName) is not a consent surface")
                 return false
@@ -309,12 +315,27 @@ enum AXScanner {
 
             Log.info("  owner consent authorises this press (\(consent.path))")
             let audit = opts.consentAudit
+            var passwordsUsed = false
+            if let field = dialog.fields.first {
+                if let secret = consent.resolveSecret() {
+                    if tree.typeInto(field, text: secret, pid: pid) {
+                        passwordsUsed = true
+                        Log.info("  filled the authentication field from the configured secret command")
+                    } else {
+                        Log.warn("  could not fill the authentication field; pressing anyway")
+                    }
+                } else if consent.secretCommand.isEmpty {
+                    Log.info("  password field present and no Secret_Command configured; pressing the grant button only")
+                } else {
+                    Log.warn("  Secret_Command produced no value; pressing the grant button only")
+                }
+            }
             guard let err = tree.press(target.id) else {
                 Log.error("  lost the button between scan and press — leaving it")
                 audit?.record(
                     app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
                     target: target.label, kind: target.kind.rawValue, host: opts.host,
-                    outcome: "press_lost"
+                    outcome: "press_lost", passwordsUsed: passwordsUsed
                 )
                 return false
             }
@@ -323,7 +344,7 @@ enum AXScanner {
                 audit?.record(
                     app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
                     target: target.label, kind: target.kind.rawValue, host: opts.host,
-                    outcome: "press_failed"
+                    outcome: "press_failed", passwordsUsed: passwordsUsed
                 )
                 return false
             }
@@ -331,7 +352,7 @@ enum AXScanner {
             audit?.record(
                 app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
                 target: target.label, kind: target.kind.rawValue, host: opts.host,
-                outcome: "pressed"
+                outcome: "pressed", passwordsUsed: passwordsUsed
             )
             return true
         }

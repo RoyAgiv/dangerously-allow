@@ -67,23 +67,47 @@ final class OwnerConsentTests: XCTestCase {
         XCTAssertThrowsError(try OwnerConsent.load(path: path))
     }
 
-    func testTheAuthHardBlockCannotBeRemoved() throws {
-        let consent = try OwnerConsent.load(path: try write(validObject()))
-        let patterns = consent.vetoPatterns(operatorPatterns: [])
+    func testAuthenticationIsBlockedUnlessTheOwnerEnablesIt() throws {
+        let blocked = try OwnerConsent.load(path: try write(validObject()))
+            .vetoPatterns(operatorPatterns: [])
         for text in [
             "Enter your password", "Touch ID required", "FileVault is turned on",
             "Keychain access", "sudo wants administrator authentication",
             "Sign in to your Apple Account",
         ] {
             XCTAssertNotNil(
-                PromptDetector.blockingPattern(screen: text, neverApprove: patterns),
-                "hard block missed: \(text)"
+                PromptDetector.blockingPattern(screen: text, neverApprove: blocked),
+                "default authentication block missed: \(text)"
             )
+        }
+        var enabled = validObject()
+        enabled["Allow_Authentication"] = true
+        let allowed = try OwnerConsent.load(path: try write(enabled))
+            .vetoPatterns(operatorPatterns: [])
+        for text in ["Enter your password", "Touch ID required", "Keychain access"] {
+            XCTAssertNil(PromptDetector.blockingPattern(screen: text, neverApprove: allowed),
+                         "owner enabled authentication: \(text)")
         }
         XCTAssertNil(PromptDetector.blockingPattern(
             screen: "node would like to access files in your Documents folder",
-            neverApprove: patterns
+            neverApprove: blocked
         ))
+    }
+
+    func testDestructiveConfirmationsStayBlockedByDefault() throws {
+        var enabled = validObject()
+        enabled["Allow_Authentication"] = true
+        let consent = try OwnerConsent.load(path: try write(enabled))
+        let patterns = consent.vetoPatterns(operatorPatterns: [])
+        XCTAssertNotNil(PromptDetector.blockingPattern(
+            screen: "Erase All Content and Settings", neverApprove: patterns))
+        XCTAssertNotNil(PromptDetector.blockingPattern(
+            screen: "Delete this volume?", neverApprove: patterns))
+        enabled["Allow_Destructive"] = true
+        let lifted = try OwnerConsent.load(path: try write(enabled))
+            .vetoPatterns(operatorPatterns: [])
+        XCTAssertNil(PromptDetector.blockingPattern(
+            screen: "Delete this volume?", neverApprove: lifted))
     }
 
     func testSystemHostDialogIsAConsentSurface() {
