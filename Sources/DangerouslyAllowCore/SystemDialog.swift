@@ -16,6 +16,9 @@ public struct SystemDialogOption: Equatable {
 public struct DetectedSystemDialog {
     /// Every labelled button on the dialog, in tree order.
     public let options: [SystemDialogOption]
+    /// Text fields on the dialog, in tree order. A password prompt carries one;
+    /// a plain consent dialog carries none.
+    public let fields: [Int]
     /// The button the policy allows pressing. nil = this is a real permission
     /// dialog, but nothing on it is acceptable — leave it for a human.
     public let target: SystemDialogOption?
@@ -25,6 +28,22 @@ public struct DetectedSystemDialog {
     public let fullText: String
     /// Stable across rescans of the same dialog; ids are deliberately excluded.
     public let fingerprint: String
+
+    public init(
+        options: [SystemDialogOption],
+        fields: [Int] = [],
+        target: SystemDialogOption?,
+        dialogText: String,
+        fullText: String,
+        fingerprint: String
+    ) {
+        self.options = options
+        self.fields = fields
+        self.target = target
+        self.dialogText = dialogText
+        self.fullText = fullText
+        self.fingerprint = fingerprint
+    }
 }
 
 /// Why a window was passed over. Surfaced by `--verbose` so an unrecognised
@@ -105,6 +124,14 @@ public enum SystemDialogDetector {
         return .allowAlways
     }
 
+    /// True when the dialog wording matches a shipped permission sentence.
+    /// Used both by `--require-trigger` and by the containment gate, which
+    /// refuses to press a native dialog whose wording it does not recognise.
+    public static func hasRecognizedTrigger(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        return permissionKeywords.contains { lowered.contains($0) }
+    }
+
     /// `requireTrigger` gates on the wording list above. The watchers leave it
     /// off: the list is transcribed from dialogs that shipped, so it only ever
     /// knows the past, and every sentence it has not met yet — Chrome's
@@ -117,7 +144,8 @@ public enum SystemDialogDetector {
     ) -> SystemDialogScan {
         var buttons: [UINode] = []
         var texts: [String] = []
-        collect(root, buttons: &buttons, texts: &texts)
+        var fields: [Int] = []
+        collect(root, buttons: &buttons, texts: &texts, fields: &fields)
 
         let labelled = buttons.filter { !$0.label.isEmpty }
         guard !labelled.isEmpty, labelled.count <= maxOptions else {
@@ -126,8 +154,7 @@ public enum SystemDialogDetector {
 
         let dialogText = texts.joined(separator: " ")
         if requireTrigger {
-            let lowered = dialogText.lowercased()
-            guard permissionKeywords.contains(where: { lowered.contains($0) }) else {
+            guard hasRecognizedTrigger(dialogText) else {
                 return .skipped(.noPermissionWording)
             }
         }
@@ -151,6 +178,7 @@ public enum SystemDialogDetector {
         return .dialog(
             DetectedSystemDialog(
                 options: options,
+                fields: fields,
                 target: target,
                 dialogText: dialogText,
                 fullText: dialogText + " " + labels.joined(separator: " "),
@@ -159,9 +187,69 @@ public enum SystemDialogDetector {
         )
     }
 
+    /// An authentication sheet lives inside an application window, so the
+    /// window as a whole has far too many buttons to be a dialog. Evaluate the
+    /// sheet subtree on its own: a small set of buttons, at least one text
+    /// field, and one primary action (e.g. "Change Password", "Unlock").
+    /// Returns nil when no sheet qualifies, so the caller can fall back to the
+    /// ordinary whole-window scan.
+    public static func detectSheet(
+        root: UINode, policy: AllowPolicy, requireTrigger: Bool = false
+    ) -> SystemDialogScan? {
+        var result: SystemDialogScan?
+        func visit(_ node: UINode) {
+            if result != nil { return }
+            if node.role == "AXSheet" || node.role == "AXDialog" {
+                var buttons: [UINode] = []
+                var texts: [String] = []
+                var fields: [Int] = []
+                collect(node, buttons: &buttons, texts: &texts, fields: &fields)
+                let labelled = buttons.filter { !$0.label.isEmpty }
+                if !fields.isEmpty, !labelled.isEmpty, labelled.count <= maxOptions {
+                    let classified = labelled.map {
+                        SystemDialogOption(id: $0.id, label: $0.label, kind: classify($0.label))
+                    }
+                    // Task-specific sheet buttons ("Change Password", "Unlock")
+                    // classify as neutral; the last non-deny action is the
+                    // sheet's real primary button.
+                    let primary = classified.last { $0.kind != .deny } ?? classified.first
+                    if let primary {
+                        // A sheet's primary button is its grant action even when
+                        // its wording is task-specific ("Change Password").
+                        let options = classified.map {
+                            $0.id == primary.id
+                                ? SystemDialogOption(id: $0.id, label: $0.label, kind: .allowAlways)
+                                : $0
+                        }
+                        let dialogText = texts.joined(separator: " ")
+                        if !requireTrigger || hasRecognizedTrigger(dialogText)
+                            || dialogText.lowercased().contains("password") {
+                            let target = policy.preference.lazy
+                                .compactMap { kind in options.first(where: { $0.kind == kind }) }
+                                .first
+                            let labels = options.map(\.label)
+                            result = .dialog(DetectedSystemDialog(
+                                options: options, fields: fields, target: target,
+                                dialogText: dialogText,
+                                fullText: dialogText + " " + labels.joined(separator: " "),
+                                fingerprint: labels.joined(separator: "|") + "\u{a7}" + dialogText
+                            ))
+                            return
+                        }
+                    }
+                }
+            }
+            for child in node.children { visit(child) }
+        }
+        visit(root)
+        return result
+    }
+
     /// Buttons are leaves — their wording belongs to the option, not to the
     /// dialog, so `--never-approve` can tell the two apart.
-    private static func collect(_ node: UINode, buttons: inout [UINode], texts: inout [String]) {
+    private static func collect(
+        _ node: UINode, buttons: inout [UINode], texts: inout [String], fields: inout [Int]
+    ) {
         // Original browser windows remain scan candidates after native dialog
         // discovery. A toolbar-free popup is still a web document, not a TCC
         // dialog, even when its wording and button count happen to match.
@@ -170,8 +258,13 @@ public enum SystemDialogDetector {
             buttons.append(node)
             return
         }
+        if node.role == "AXTextField" || node.role == "AXSecureTextField" {
+            fields.append(node.id)
+        }
         if !node.label.isEmpty { texts.append(node.label) }
         if !node.text.isEmpty { texts.append(node.text) }
-        for child in node.children { collect(child, buttons: &buttons, texts: &texts) }
+        for child in node.children {
+            collect(child, buttons: &buttons, texts: &texts, fields: &fields)
+        }
     }
 }

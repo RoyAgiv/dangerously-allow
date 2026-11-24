@@ -3,13 +3,14 @@ import Foundation
 /// Which grant tier each channel is willing to press. They differ by default
 /// because the same word means different things in the two places: "Allow" on
 /// a TCC dialog is written to disk and outlives the process, while "Allow once"
-/// on an in-app card really is one-shot. So the dialog channel needs `always`
-/// to do anything at all, and the card channel can afford to stay cautious.
+/// on an in-app card really is one-shot. So the dialog channel is pinned to
+/// `once` — a permanent "Allow" is never eligible — and the card channel keeps
+/// the cautious session default.
 public struct DesktopPolicies {
     public var dialog: AllowPolicy
     public var card: AllowPolicy
 
-    public init(dialog: AllowPolicy = .always, card: AllowPolicy = .session) {
+    public init(dialog: AllowPolicy = .once, card: AllowPolicy = .session) {
         self.dialog = dialog
         self.card = card
     }
@@ -53,6 +54,18 @@ public enum DesktopRouter {
         policies: DesktopPolicies,
         requireTrigger: Bool = false
     ) -> DesktopRoute {
+        // A window that *is* a sheet or dialog is a native surface, not an
+        // in-app card, whatever its wording or grant tier. Route it to the
+        // system-dialog channel — where containment decides — and never let the
+        // card path press it.
+        if NativeDialogSurface.isDialog(role: window.role, subrole: "") {
+            if case let .dialog(dialog) = SystemDialogDetector.detect(
+                root: window, policy: policies.dialog, requireTrigger: false
+            ) {
+                return .systemDialog(dialog)
+            }
+            return .ignored
+        }
         if case let .dialog(dialog) = SystemDialogDetector.detect(
             root: window, policy: policies.dialog, requireTrigger: true
         ) {

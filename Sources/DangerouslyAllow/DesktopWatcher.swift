@@ -4,19 +4,22 @@ import DangerouslyAllowCore
 
 struct DesktopOptions {
     var policies = DesktopPolicies()
-    /// Apps whose in-app approval cards are answered. System dialogs are
-    /// recognised by wording wherever they appear and ignore this list.
-    var apps: [String] = AgentApps.defaults
+    /// Apps whose in-app approval cards are answered. Empty by default: a bare
+    /// invocation names no app and therefore presses no card. System dialogs
+    /// are recognised by wording wherever they appear and ignore this list.
+    var apps: [String] = []
     var dryRun = false
     var stopAfterFirst = false
     var pollInterval: TimeInterval = 0.5
     var neverApprove: [String] = []
-    /// Gate prompts on recognised wording. Off: a wording list only knows
-    /// the prompts it has already met, and the ones it has not are walked
-    /// past in silence. `--require-trigger` puts it back.
+    /// Gate prompts on recognised wording. Off for cards: a wording list only
+    /// knows the prompts it has already met. Native dialogs always require it.
     var requireTrigger = false
     var verbose = false
     var notify = false
+    /// The native-GUI containment gate. Nil is treated as "no capability", so
+    /// a missing gate can only ever observe — it can never press.
+    var gate: NativeGuiGate?
 }
 
 /// The whole desktop surface in one process: the approval cards the ChatGPT and
@@ -30,6 +33,7 @@ struct DesktopOptions {
 final class DesktopWatcher {
     private let opts: DesktopOptions
     private let tree = AXTree()
+    private let probe: AppIdentityProbing = CodeSigningIdentityProbe()
     /// Fingerprints already acted on, pruned each pass to whatever is still on
     /// screen — a card lingers for several frames after it is pressed, and
     /// re-pressing it would answer the *next* prompt by accident.
@@ -81,6 +85,9 @@ final class DesktopWatcher {
         let options: [(label: String, kind: OptionKind)]
         let target: (id: Int, label: String, kind: OptionKind)?
         let policy: AllowPolicy
+        /// Native dialogs only: true when `SystemDialogDetector` recognised the
+        /// wording. The containment gate refuses an unrecognised prompt.
+        let triggerRecognized: Bool
     }
 
     func run() {
@@ -89,14 +96,13 @@ final class DesktopWatcher {
             Log.warn("AXIsProcessTrusted() = false — grant this terminal Accessibility in")
             Log.warn("  System Settings → Privacy & Security → Accessibility, then re-run")
         }
-        Log.info("watching the desktop\(opts.dryRun ? "  (DRY RUN — nothing pressed)" : "")")
-        Log.info("  cards in: \(opts.apps.joined(separator: ", "))")
+        Log.info("observing the desktop\(opts.dryRun ? "  (DRY RUN)" : "")")
+        Log.info("  native dialogs: \(opts.gate?.summary ?? "observe-only — no gate")")
+        Log.info("  cards in: " + (opts.apps.isEmpty
+            ? "none — name an approved app with --app plus --approve-cards"
+            : opts.apps.joined(separator: ", ")))
         Log.info("  policy: cards \(opts.policies.card.rawValue), "
             + "system dialogs \(opts.policies.dialog.rawValue)")
-        if opts.policies.dialog == .always {
-            Log.info("  a TCC grant is permanent — \"Allow\" is pressed; refusals and")
-            Log.info("    \"Open System Settings\" never are. --policy session to be cautious")
-        }
         if !opts.neverApprove.isEmpty {
             Log.info("  never-approve: \(opts.neverApprove.joined(separator: ", "))")
         }
@@ -146,7 +152,7 @@ final class DesktopWatcher {
             }
             let cardsAllowed = AgentApps.isWatched(
                 name: app.localizedName, bundleID: app.bundleIdentifier, in: opts.apps
-            )
+            ) && isPinnedApp(app)
             let appDeadline = Date(
                 timeIntervalSinceNow: cardsAllowed ? Self.perCardAppWalk : Self.perAppWalk
             )
@@ -172,7 +178,7 @@ final class DesktopWatcher {
 
                 seen.insert(answer.fingerprint)
                 guard handled.insert(answer.fingerprint).inserted else { continue }
-                if handle(answer, appName: app.localizedName ?? "?") {
+                if handle(answer, appName: app.localizedName ?? "?", pid: app.processIdentifier) {
                     pressed = true
                     lastAnswered = app.processIdentifier
                     if opts.stopAfterFirst { return true }
@@ -198,7 +204,8 @@ final class DesktopWatcher {
                 fullText: d.fullText,
                 options: d.options.map { ($0.label, $0.kind) },
                 target: d.target.map { ($0.id, $0.label, $0.kind) },
-                policy: opts.policies.dialog
+                policy: opts.policies.dialog,
+                triggerRecognized: SystemDialogDetector.hasRecognizedTrigger(d.fullText)
             )
         case let .card(c):
             return Answer(
@@ -208,7 +215,8 @@ final class DesktopWatcher {
                 fullText: c.fullText,
                 options: c.options.map { ($0.label, $0.kind) },
                 target: c.target.map { ($0.id, $0.label, $0.kind) },
-                policy: opts.policies.card
+                policy: opts.policies.card,
+                triggerRecognized: true
             )
         case .ignored:
             return nil
@@ -216,9 +224,10 @@ final class DesktopWatcher {
     }
 
     /// Returns true when the prompt was confirmed.
-    private func handle(_ answer: Answer, appName: String) -> Bool {
+    private func handle(_ answer: Answer, appName: String, pid: pid_t) -> Bool {
         if let blocked = PromptDetector.blockingPattern(
-            screen: answer.fullText, neverApprove: opts.neverApprove
+            screen: answer.fullText,
+            neverApprove: NativeGuiContainment.effectiveNeverApprove(opts.neverApprove)
         ) {
             Log.warn("REFUSING — \(answer.channel) matches --never-approve /\(blocked)/")
             Log.warn("  leaving for a human: \(answer.text.prefix(140))")
@@ -246,6 +255,28 @@ final class DesktopWatcher {
             Log.info("  [dry-run] pressed nothing")
             return false
         }
+
+        // The native-GUI channel may not press until the containment gate
+        // returns an authorisation. A dry run returns above, so it never
+        // consumes a capability's nonce.
+        if answer.channel == "system dialog" {
+            let decision = opts.gate?.authorize(
+                promptFingerprint: answer.fingerprint,
+                promptText: answer.text,
+                targetLabel: target.label,
+                targetKind: target.kind,
+                triggerRecognized: answer.triggerRecognized,
+                pid: pid
+            ) ?? .observe(.missingCapability)
+            guard case let .press(action) = decision else {
+                Log.warn("  observe-only — native dialog not pressed (\(decision.reason))")
+                if opts.notify { Notify.post("Native dialog in \(appName) left for a human") }
+                return false
+            }
+            Log.info("  one-use capability \(action.capabilityNonce.prefix(8))… "
+                + "authorises this press (task \(action.taskID))")
+        }
+
         guard let err = tree.press(target.id) else {
             Log.error("  lost the element between scan and press — leaving it")
             return false
@@ -256,5 +287,12 @@ final class DesktopWatcher {
         }
         Log.error("  press failed (AXError \(err.rawValue))")
         return false
+    }
+
+    /// An app's cards are only pressable when its live code signature satisfies
+    /// the pinned designated requirement. The name is not enough: an unsigned
+    /// bundle can call itself "ChatGPT".
+    private func isPinnedApp(_ app: NSRunningApplication) -> Bool {
+        probe.identity(forPID: app.processIdentifier)?.satisfiesPinnedRequirement == true
     }
 }

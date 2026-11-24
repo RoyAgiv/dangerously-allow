@@ -3,17 +3,17 @@ import ApplicationServices
 import DangerouslyAllowCore
 
 struct GuiWatchOptions {
-    /// `always` by default, unlike the other paths. A TCC dialog almost never
-    /// offers a session- or once-scoped button, so a `session` default would
-    /// make `gui` a no-op on the common dialogs. Neutral and deny stay
-    /// unpressable regardless of policy, so this presses grants only.
-    var policy: AllowPolicy = .always
+    /// `once` by default. A TCC dialog's plain "Allow" is a permanent grant
+    /// however mildly it is worded, so only an explicitly one-shot button is
+    /// ever eligible — and even that needs the containment gate's capability.
+    var policy: AllowPolicy = .once
     var dryRun = false
     var stopAfterFirst = false
     var pollInterval: TimeInterval = 0.5
     var neverApprove: [String] = []
     /// Gate dialogs on recognised wording — see `DesktopOptions`. Off by
-    /// default; `--require-trigger` puts it back.
+    /// default for discovery, but the containment gate always requires it
+    /// before a press.
     var requireTrigger = false
     /// Log every dialog-shaped window and why it was passed over — for
     /// diagnosing wording the keyword list does not know yet.
@@ -21,6 +21,16 @@ struct GuiWatchOptions {
     /// Print every window carrying any text once, then exit.
     var dump = false
     var notify = false
+    /// Native-GUI containment. Nil is treated as "no capability", so it can
+    /// only observe.
+    var gate: NativeGuiGate?
+    /// Explicit owner authorization to answer consent dialogs without a
+    /// per-press capability. Nil (the default) keeps the capability gate as
+    /// the only press path.
+    var ownerConsent: OwnerConsent?
+    /// The host recorded in the consent audit trail.
+    var host: String = ProcessInfo.processInfo.hostName
+    var consentAudit: OwnerConsentAudit? = OwnerConsentAudit(directory: OwnerConsentAudit.defaultDirectory())
 }
 
 /// Auto-clicks native macOS TCC dialogs (Microphone, Screen Recording,
@@ -32,25 +42,32 @@ struct GuiWatchOptions {
 /// presented by whichever process the system chose, so every running app is
 /// scanned. `SystemDialogDetector` decides what is a dialog, and — because a
 /// grant here is written to the TCC database and outlives the process — the
-/// default `session` policy declines a plain "Allow" and leaves it to a human.
+/// channel is observe-only until the containment gate holds a signed one-use
+/// capability, and even then only an explicit one-shot button is eligible.
 enum AXScanner {
     static func run(options: GuiWatchOptions) {
-        Log.info("scanning for macOS permission dialogs\(options.dryRun ? "  (DRY RUN — nothing pressed)" : "")")
+        Log.info("scanning for macOS permission dialogs\(options.dryRun ? "  (DRY RUN)" : "")")
         Log.info("policy: \(options.policy.rawValue)  poll: \(options.pollInterval)s — Ctrl+C to stop")
-        if options.policy == .always {
-            Log.info("a TCC grant is permanent — this presses \"Allow\"; refusals and")
-            Log.info("  \"Open System Settings\" are never pressed. --policy session to be cautious")
-        } else {
-            Log.info("a TCC grant is permanent, so --policy \(options.policy.rawValue) presses only")
-            Log.info("  explicitly one-shot buttons (\"Allow Once\"); use --policy always for \"Allow\"")
+        Log.info("native dialogs: \(options.gate?.summary ?? "observe-only — no gate")")
+        if options.ownerConsent == nil {
+            Log.info("a TCC grant is permanent — a plain \"Allow\" is never pressed; a press")
+            Log.info("  needs an explicit one-shot button plus a valid one-use capability")
         }
         if !options.neverApprove.isEmpty {
             Log.info("never-approve: \(options.neverApprove.joined(separator: ", "))")
+        }
+        if let consent = options.ownerConsent {
+            Log.info("owner consent: \(consent.path) "
+                + "(permanent grants \(consent.allowPermanent ? "allowed" : "refused"))")
         }
 
         AXTree.capMessagingTimeout()
         if !AXIsProcessTrusted() {
             Log.warn("AXIsProcessTrusted() = false — re-run with sudo, or grant Accessibility")
+        } else {
+            // Positive capability evidence for the supervising heartbeat. It
+            // is only printed from a context that can actually read windows.
+            Log.info("AXIsProcessTrusted() = true")
         }
 
         let scanner = Scan(options: options)
@@ -132,15 +149,21 @@ enum AXScanner {
             for app in order {
                 scanned += 1
                 let name = app.localizedName ?? "pid:\(app.processIdentifier)"
+                // System Settings hosts inline authentication sheets inside a
+                // large window; its AX tree needs a longer, deeper read so the
+                // sheet is reached before the budget ends.
+                let isSettings = app.bundleIdentifier == "com.apple.systempreferences"
                 let appStarted = Date()
-                let appDeadline = Date(timeIntervalSinceNow: Self.perAppWalk)
+                let appDeadline = Date(timeIntervalSinceNow: isSettings ? 8 : Self.perAppWalk)
                 defer {
                     let cost = Date().timeIntervalSince(appStarted)
                     if opts.verbose, cost > 0.2 {
                         Log.info("  slow: \(name) took " + String(format: "%.1f", cost) + "s")
                     }
                 }
-                for window in tree.windows(ofPID: app.processIdentifier) {
+                let windows = tree.windows(ofPID: app.processIdentifier)
+                if isSettings, opts.verbose { Log.info("  settings windows: \(windows.count)") }
+                for window in windows {
                     // Windows come front-to-back, so a dialog is at the top of
                     // the list; the tail is what runs the clock down.
                     if Date() >= appDeadline, !opts.dump { break }
@@ -148,12 +171,28 @@ enum AXScanner {
                     // whole Electron window to discover it is not one costs a
                     // synchronous round trip per node, and used to stall the
                     // sweep long enough to miss the dialog entirely.
-                    guard let root = tree.build(window, budget: AXTree.dialogNodes, within: 0.3),
-                          !tree.truncated || opts.dump else { continue }
+                    guard let root = tree.build(
+                        window,
+                        budget: isSettings ? 5000 : AXTree.dialogNodes,
+                        within: isSettings ? 5 : 0.3,
+                        timeout: isSettings ? 2 : nil
+                    ), !tree.truncated || opts.dump else { continue }
 
-                    switch SystemDialogDetector.detect(
+                    if isSettings, opts.verbose {
+                        var sheet = false
+                        func findSheet(_ node: UINode) {
+                            if node.role == "AXSheet" { sheet = true }
+                            for child in node.children { findSheet(child) }
+                        }
+                        findSheet(root)
+                        Log.info("  settings tree root=\(root.role) sheet=\(sheet) truncated=\(tree.truncated)")
+                    }
+                    let scan = SystemDialogDetector.detectSheet(
                         root: root, policy: opts.policy, requireTrigger: opts.requireTrigger
-                    ) {
+                    ) ?? SystemDialogDetector.detect(
+                        root: root, policy: opts.policy, requireTrigger: opts.requireTrigger
+                    )
+                    switch scan {
                     case let .dialog(dialog):
                         if opts.dump {
                             report(root, appName: name, note: "dialog", force: true)
@@ -161,7 +200,7 @@ enum AXScanner {
                         }
                         seen.insert(dialog.fingerprint)
                         guard handled.insert(dialog.fingerprint).inserted else { continue }
-                        if handle(dialog, appName: name) {
+                        if handle(dialog, appName: name, pid: app.processIdentifier) {
                             pressed = true
                             lastAnswered = app.processIdentifier
                             if opts.stopAfterFirst { return true }
@@ -180,9 +219,15 @@ enum AXScanner {
         }
 
         /// Returns true when the dialog was confirmed.
-        private func handle(_ dialog: DetectedSystemDialog, appName: String) -> Bool {
+        private func handle(_ dialog: DetectedSystemDialog, appName: String, pid: pid_t) -> Bool {
+            // Owner consent owns the veto list: it can lift the authentication
+            // block deliberately, so the capability path's baseline must not be
+            // layered on top of it.
+            let veto = opts.ownerConsent?.vetoPatterns(operatorPatterns: opts.neverApprove)
+                ?? NativeGuiContainment.effectiveNeverApprove(opts.neverApprove)
             if let blocked = PromptDetector.blockingPattern(
-                screen: dialog.fullText, neverApprove: opts.neverApprove
+                screen: dialog.fullText,
+                neverApprove: veto
             ) {
                 Log.warn("REFUSING — dialog matches --never-approve /\(blocked)/")
                 Log.warn("  leaving for a human: \(dialog.dialogText.prefix(140))")
@@ -209,6 +254,31 @@ enum AXScanner {
                 Log.info("  [dry-run] pressed nothing")
                 return false
             }
+
+            if let consent = opts.ownerConsent {
+                return pressUnderOwnerConsent(
+                    consent, dialog: dialog, target: target, appName: appName, pid: pid
+                )
+            }
+
+            // The single native-GUI press path. A dry run returns above, so it
+            // never consumes a capability's nonce.
+            let decision = opts.gate?.authorize(
+                promptFingerprint: dialog.fingerprint,
+                promptText: dialog.dialogText,
+                targetLabel: target.label,
+                targetKind: target.kind,
+                triggerRecognized: SystemDialogDetector.hasRecognizedTrigger(dialog.fullText),
+                pid: pid
+            ) ?? .observe(.missingCapability)
+            guard case let .press(action) = decision else {
+                Log.warn("  observe-only — not pressed (\(decision.reason))")
+                if opts.notify { Notify.post("Permission dialog in \(appName) left for a human") }
+                return false
+            }
+            Log.info("  one-use capability \(action.capabilityNonce.prefix(8))… "
+                + "authorises this press (task \(action.taskID))")
+
             guard let err = tree.press(target.id) else {
                 Log.error("  lost the button between scan and press — leaving it")
                 return false
@@ -219,6 +289,109 @@ enum AXScanner {
             }
             Log.error("  press failed (AXError \(err.rawValue))")
             return false
+        }
+
+        /// Owner-consent path. The file is the authorization; the hard block
+        /// and the operator's veto list still apply, and the dialog must be a
+        /// real consent surface rather than an arbitrary small window.
+        private func pressUnderOwnerConsent(
+            _ consent: OwnerConsent,
+            dialog: DetectedSystemDialog,
+            target: SystemDialogOption,
+            appName: String,
+            pid: pid_t
+        ) -> Bool {
+            let bundleID = CodeSigningIdentityProbe().identity(forPID: pid)?.bundleID
+            let triggerRecognized = SystemDialogDetector.hasRecognizedTrigger(dialog.fullText)
+            guard OwnerConsent.isConsentDialog(
+                dialog: dialog, bundleID: bundleID, triggerRecognized: triggerRecognized,
+                allowAny: consent.allowAnyDialog
+            ) else {
+                Log.warn("  owner consent declined — window of \(appName) is not a consent surface")
+                return false
+            }
+            if let blocked = PromptDetector.blockingPattern(
+                screen: dialog.fullText,
+                neverApprove: consent.vetoPatterns(operatorPatterns: opts.neverApprove)
+            ) {
+                Log.warn("REFUSING — owner-consent hard block /\(blocked)/")
+                Log.warn("  leaving for a human: \(dialog.dialogText.prefix(140))")
+                if opts.notify { Notify.post("Owner consent vetoed a prompt in \(appName)") }
+                opts.consentAudit?.record(
+                    app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                    target: target.label, kind: target.kind.rawValue, host: opts.host,
+                    outcome: "vetoed"
+                )
+                return false
+            }
+            if target.kind == .allowAlways && !consent.allowPermanent {
+                Log.warn("  owner consent allows one-shot grants only — leaving permanent grant")
+                if opts.notify { Notify.post("Permanent grant in \(appName) needs the owner") }
+                opts.consentAudit?.record(
+                    app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                    target: target.label, kind: target.kind.rawValue, host: opts.host,
+                    outcome: "permanent_not_authorized"
+                )
+                return false
+            }
+
+            Log.info("  owner consent authorises this press (\(consent.path))")
+            let audit = opts.consentAudit
+            var passwordsUsed = false
+            if let field = dialog.fields.first {
+                // A password field in an untrusted window is exactly the
+                // fabricated-dialog credential-theft shape. Never type into it
+                // and do not interact with the window at all.
+                guard OwnerConsent.isTrustedSecretDialog(
+                    bundleID: bundleID, text: dialog.fullText
+                ) else {
+                    Log.warn("REFUSING — password field in an untrusted dialog (\(bundleID ?? "unknown"))")
+                    if opts.notify { Notify.post("Refused a fabricated password dialog in \(appName)") }
+                    audit?.record(
+                        app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                        target: target.label, kind: target.kind.rawValue, host: opts.host,
+                        outcome: "untrusted_secret_dialog"
+                    )
+                    return false
+                }
+                if let secret = consent.resolveSecret() {
+                    if tree.typeInto(field, text: secret, pid: pid) {
+                        passwordsUsed = true
+                        Log.info("  filled the authentication field from the configured secret command")
+                    } else {
+                        Log.warn("  could not fill the authentication field; pressing anyway")
+                    }
+                } else if consent.secretCommand.isEmpty {
+                    Log.info("  password field present and no Secret_Command configured; pressing the grant button only")
+                } else {
+                    Log.warn("  Secret_Command produced no value; pressing the grant button only")
+                }
+            }
+            guard let err = tree.press(target.id) else {
+                Log.error("  lost the button between scan and press — leaving it")
+                audit?.record(
+                    app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                    target: target.label, kind: target.kind.rawValue, host: opts.host,
+                    outcome: "press_lost", passwordsUsed: passwordsUsed
+                )
+                return false
+            }
+            guard err == .success else {
+                Log.error("  press failed (AXError \(err.rawValue))")
+                audit?.record(
+                    app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                    target: target.label, kind: target.kind.rawValue, host: opts.host,
+                    outcome: "press_failed", passwordsUsed: passwordsUsed
+                )
+                return false
+            }
+            Log.info("  pressed \"\(target.label)\" under owner consent")
+            audit?.record(
+                app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                target: target.label, kind: target.kind.rawValue, host: opts.host,
+                outcome: "pressed", passwordsUsed: passwordsUsed
+            )
+            return true
         }
 
         // MARK: - diagnostics

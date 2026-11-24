@@ -3,7 +3,7 @@ BINDIR := $(DESTDIR)$(PREFIX)/bin
 BIN    := dangerously-allow
 RELEASE := .build/release/$(BIN)
 
-.PHONY: all build release test integration check install uninstall clean help
+.PHONY: all build release test integration containment check install uninstall clean help
 
 all: build
 
@@ -23,8 +23,12 @@ test:
 integration: build
 	./tools/integration-test.sh
 
+## containment — executable-level native GUI containment tests
+containment: build
+	./tools/containment-test.sh
+
 ## check   — everything
-check: test integration
+check: test integration containment
 
 ## install — build release and install the binary into $(PREFIX)/bin
 install: release
