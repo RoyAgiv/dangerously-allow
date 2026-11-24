@@ -149,15 +149,21 @@ enum AXScanner {
             for app in order {
                 scanned += 1
                 let name = app.localizedName ?? "pid:\(app.processIdentifier)"
+                // System Settings hosts inline authentication sheets inside a
+                // large window; its AX tree needs a longer, deeper read so the
+                // sheet is reached before the budget ends.
+                let isSettings = app.bundleIdentifier == "com.apple.systempreferences"
                 let appStarted = Date()
-                let appDeadline = Date(timeIntervalSinceNow: Self.perAppWalk)
+                let appDeadline = Date(timeIntervalSinceNow: isSettings ? 8 : Self.perAppWalk)
                 defer {
                     let cost = Date().timeIntervalSince(appStarted)
                     if opts.verbose, cost > 0.2 {
                         Log.info("  slow: \(name) took " + String(format: "%.1f", cost) + "s")
                     }
                 }
-                for window in tree.windows(ofPID: app.processIdentifier) {
+                let windows = tree.windows(ofPID: app.processIdentifier)
+                if isSettings, opts.verbose { Log.info("  settings windows: \(windows.count)") }
+                for window in windows {
                     // Windows come front-to-back, so a dialog is at the top of
                     // the list; the tail is what runs the clock down.
                     if Date() >= appDeadline, !opts.dump { break }
@@ -165,12 +171,28 @@ enum AXScanner {
                     // whole Electron window to discover it is not one costs a
                     // synchronous round trip per node, and used to stall the
                     // sweep long enough to miss the dialog entirely.
-                    guard let root = tree.build(window, budget: AXTree.dialogNodes, within: 0.3),
-                          !tree.truncated || opts.dump else { continue }
+                    guard let root = tree.build(
+                        window,
+                        budget: isSettings ? 5000 : AXTree.dialogNodes,
+                        within: isSettings ? 5 : 0.3,
+                        timeout: isSettings ? 2 : nil
+                    ), !tree.truncated || opts.dump else { continue }
 
-                    switch SystemDialogDetector.detect(
+                    if isSettings, opts.verbose {
+                        var sheet = false
+                        func findSheet(_ node: UINode) {
+                            if node.role == "AXSheet" { sheet = true }
+                            for child in node.children { findSheet(child) }
+                        }
+                        findSheet(root)
+                        Log.info("  settings tree root=\(root.role) sheet=\(sheet) truncated=\(tree.truncated)")
+                    }
+                    let scan = SystemDialogDetector.detectSheet(
                         root: root, policy: opts.policy, requireTrigger: opts.requireTrigger
-                    ) {
+                    ) ?? SystemDialogDetector.detect(
+                        root: root, policy: opts.policy, requireTrigger: opts.requireTrigger
+                    )
+                    switch scan {
                     case let .dialog(dialog):
                         if opts.dump {
                             report(root, appName: name, note: "dialog", force: true)

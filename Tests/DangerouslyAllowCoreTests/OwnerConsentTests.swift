@@ -132,6 +132,19 @@ final class OwnerConsentTests: XCTestCase {
         ))
     }
 
+    func testAuthenticationSheetInsideAWindowIsDetected() {
+        let field = UINode(id: 1, role: "AXTextField")
+        let button = UINode(id: 2, role: "AXButton", label: "Change Password")
+        let sheet = UINode(id: 3, role: "AXSheet", children: [field, button])
+        let root = UINode(id: 4, role: "AXWindow", children: [sheet])
+        guard case let .dialog(dialog)? = SystemDialogDetector.detectSheet(
+            root: root, policy: .always) else {
+            return XCTFail("sheet not detected")
+        }
+        XCTAssertEqual(dialog.fields, [1])
+        XCTAssertEqual(dialog.target?.label, "Change Password")
+    }
+
     func testPasswordsOnlyGoToSystemAuthenticationSurfaces() {
         XCTAssertTrue(OwnerConsent.isTrustedSecretDialog(
             bundleID: "com.apple.SecurityAgent",

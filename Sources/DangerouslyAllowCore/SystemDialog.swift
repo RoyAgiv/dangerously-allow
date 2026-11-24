@@ -187,6 +187,64 @@ public enum SystemDialogDetector {
         )
     }
 
+    /// An authentication sheet lives inside an application window, so the
+    /// window as a whole has far too many buttons to be a dialog. Evaluate the
+    /// sheet subtree on its own: a small set of buttons, at least one text
+    /// field, and one primary action (e.g. "Change Password", "Unlock").
+    /// Returns nil when no sheet qualifies, so the caller can fall back to the
+    /// ordinary whole-window scan.
+    public static func detectSheet(
+        root: UINode, policy: AllowPolicy, requireTrigger: Bool = false
+    ) -> SystemDialogScan? {
+        var result: SystemDialogScan?
+        func visit(_ node: UINode) {
+            if result != nil { return }
+            if node.role == "AXSheet" || node.role == "AXDialog" {
+                var buttons: [UINode] = []
+                var texts: [String] = []
+                var fields: [Int] = []
+                collect(node, buttons: &buttons, texts: &texts, fields: &fields)
+                let labelled = buttons.filter { !$0.label.isEmpty }
+                if !fields.isEmpty, !labelled.isEmpty, labelled.count <= maxOptions {
+                    let classified = labelled.map {
+                        SystemDialogOption(id: $0.id, label: $0.label, kind: classify($0.label))
+                    }
+                    // Task-specific sheet buttons ("Change Password", "Unlock")
+                    // classify as neutral; the last non-deny action is the
+                    // sheet's real primary button.
+                    let primary = classified.last { $0.kind != .deny } ?? classified.first
+                    if let primary {
+                        // A sheet's primary button is its grant action even when
+                        // its wording is task-specific ("Change Password").
+                        let options = classified.map {
+                            $0.id == primary.id
+                                ? SystemDialogOption(id: $0.id, label: $0.label, kind: .allowAlways)
+                                : $0
+                        }
+                        let dialogText = texts.joined(separator: " ")
+                        if !requireTrigger || hasRecognizedTrigger(dialogText)
+                            || dialogText.lowercased().contains("password") {
+                            let target = policy.preference.lazy
+                                .compactMap { kind in options.first(where: { $0.kind == kind }) }
+                                .first
+                            let labels = options.map(\.label)
+                            result = .dialog(DetectedSystemDialog(
+                                options: options, fields: fields, target: target,
+                                dialogText: dialogText,
+                                fullText: dialogText + " " + labels.joined(separator: " "),
+                                fingerprint: labels.joined(separator: "|") + "\u{a7}" + dialogText
+                            ))
+                            return
+                        }
+                    }
+                }
+            }
+            for child in node.children { visit(child) }
+        }
+        visit(root)
+        return result
+    }
+
     /// Buttons are leaves — their wording belongs to the option, not to the
     /// dialog, so `--never-approve` can tell the two apart.
     private static func collect(

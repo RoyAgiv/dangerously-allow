@@ -26,6 +26,7 @@ final class AXTree {
     private var nextID = 0
     private var budget = 0
     private var deadline = Date.distantFuture
+    private var elementTimeout: Float = AXTree.messagingTimeout
 
     static let maxDepth = 40
     /// Enough for an Electron app's renderer tree, where an approval card sits
@@ -57,13 +58,17 @@ final class AXTree {
     /// tree, but not a *slow* one: against an app that has stopped answering,
     /// every read costs the full messaging timeout, and even a few hundred
     /// nodes can stall the sweep for minutes. Time is the honest unit.
-    func build(_ element: AXUIElement, budget: Int = maxNodes, within: TimeInterval) -> UINode? {
+    func build(
+        _ element: AXUIElement, budget: Int = maxNodes, within: TimeInterval,
+        timeout: Float? = nil
+    ) -> UINode? {
         pressables.removeAll()
         textFields.removeAll()
         truncated = false
         nextID = 0
         self.budget = budget
         deadline = Date(timeIntervalSinceNow: within)
+        elementTimeout = timeout ?? AXTree.messagingTimeout
         return node(element, depth: 0)
     }
 
@@ -122,9 +127,13 @@ final class AXTree {
 
     func windows(ofPID pid: pid_t) -> [AXUIElement] {
         let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, Self.messagingTimeout)
-        let windows = attribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
         let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""
+        // System Settings is slow enough that a quarter-second timeout returns
+        // no windows at all, which hides its inline authentication sheets.
+        AXUIElementSetMessagingTimeout(
+            app, bundleID == "com.apple.systempreferences" ? 2.0 : Self.messagingTimeout
+        )
+        let windows = attribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []
         guard ["com.google.Chrome", "com.google.Chrome.beta", "com.google.Chrome.dev",
                "com.google.Chrome.canary", "org.chromium.Chromium"].contains(bundleID)
         else { return windows }
