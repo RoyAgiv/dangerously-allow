@@ -108,6 +108,12 @@ final class OwnerConsentTests: XCTestCase {
             .vetoPatterns(operatorPatterns: [])
         XCTAssertNil(PromptDetector.blockingPattern(
             screen: "Delete this volume?", neverApprove: lifted))
+        // Whole-machine destruction is never lifted, even with the broad flag.
+        for text in ["Erase All Content and Settings", "Factory reset",
+                     "Reinstall macOS", "Erase this Mac"] {
+            XCTAssertNotNil(PromptDetector.blockingPattern(screen: text, neverApprove: lifted),
+                            "catastrophic block missed: \(text)")
+        }
     }
 
     func testSystemHostDialogIsAConsentSurface() {
@@ -124,6 +130,26 @@ final class OwnerConsentTests: XCTestCase {
         XCTAssertTrue(OwnerConsent.isConsentDialog(
             dialog: dialog, bundleID: "com.apple.UserNotificationCenter", triggerRecognized: false
         ))
+    }
+
+    func testPasswordsOnlyGoToSystemAuthenticationSurfaces() {
+        XCTAssertTrue(OwnerConsent.isTrustedSecretDialog(
+            bundleID: "com.apple.SecurityAgent",
+            text: "Enter your password to make changes."))
+        XCTAssertTrue(OwnerConsent.isTrustedSecretDialog(
+            bundleID: "com.apple.UserNotificationCenter",
+            text: "Administrator authentication required"))
+        // A fabricated dialog owned by an ordinary app is never filled.
+        XCTAssertFalse(OwnerConsent.isTrustedSecretDialog(
+            bundleID: "com.apple.osascript",
+            text: "Enter your password"))
+        XCTAssertFalse(OwnerConsent.isTrustedSecretDialog(
+            bundleID: "com.example.app",
+            text: "Enter your password"))
+        // A trusted surface without authentication wording is not a password prompt.
+        XCTAssertFalse(OwnerConsent.isTrustedSecretDialog(
+            bundleID: "com.apple.UserNotificationCenter",
+            text: "node would like to access your Documents folder"))
     }
 
     func testAnUnrecognisedAppDialogIsNotAConsentSurface() {

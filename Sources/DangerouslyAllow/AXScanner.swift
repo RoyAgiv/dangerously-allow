@@ -317,6 +317,21 @@ enum AXScanner {
             let audit = opts.consentAudit
             var passwordsUsed = false
             if let field = dialog.fields.first {
+                // A password field in an untrusted window is exactly the
+                // fabricated-dialog credential-theft shape. Never type into it
+                // and do not interact with the window at all.
+                guard OwnerConsent.isTrustedSecretDialog(
+                    bundleID: bundleID, text: dialog.fullText
+                ) else {
+                    Log.warn("REFUSING — password field in an untrusted dialog (\(bundleID ?? "unknown"))")
+                    if opts.notify { Notify.post("Refused a fabricated password dialog in \(appName)") }
+                    audit?.record(
+                        app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                        target: target.label, kind: target.kind.rawValue, host: opts.host,
+                        outcome: "untrusted_secret_dialog"
+                    )
+                    return false
+                }
                 if let secret = consent.resolveSecret() {
                     if tree.typeInto(field, text: secret, pid: pid) {
                         passwordsUsed = true

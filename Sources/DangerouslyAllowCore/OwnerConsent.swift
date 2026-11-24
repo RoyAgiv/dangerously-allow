@@ -29,11 +29,37 @@ public struct OwnerConsent: Equatable {
     /// `Allow_Authentication: true`; the fleet owner did.
     public static let authenticationBlock = #"(?i)(password|passphrase|keychain|credential|secret|private[ -]?key|touch[ -]?id|filevault|apple[ -]?id|sudo|administrat(?:or|ion)|authenticate|authoriz|unlock|signing|system extension)"#
 
-    /// Irreversible actions. Kept unless `Allow_Destructive: true`. These are
-    /// not consent grants: pressing the grant button on "Erase All Content and
-    /// Settings" destroys the machine, and no unattended watcher should do it
-    /// by default.
-    public static let destructiveBlock = #"(?i)(erase all|erase (?:the |this )?(?:disk|volume|mac)|delete all|delete (?:the |this )?(?:disk|volume|account)|remove all|factory reset|reset all|format (?:the |this )?(?:disk|volume)|overwrite|shut ?down|reboot|restart now|log out now|sign out now)"#
+    /// Destructive maintenance (delete/format a volume or folder, overwrite,
+    /// reboot). Lifted by `Allow_Destructive: true`.
+    public static let destructiveBlock = #"(?i)(erase (?:the |this )?(?:disk|volume)|delete (?:the |this )?(?:disk|volume|account)|delete all|remove all|format (?:the |this )?(?:disk|volume)|overwrite|shut ?down|reboot|restart now|log out now|sign out now)"#
+
+    /// Whole-machine destruction. Never lifted: no unattended watcher should
+    /// erase the Mac it runs on, even under a broad owner authorization.
+    public static let catastrophicBlock = #"(?i)(erase all content|erase all data|erase (?:the |this )?mac|erase (?:the |this )?system|factory reset|reset all settings|reinstall macos|format (?:the |this )?macintosh hd|erase all settings)"#
+
+    /// Windows that may receive a typed password. A fabricated dialog owned by
+    /// an arbitrary app must never get the secret; only the system's own
+    /// authentication surfaces do.
+    public static let trustedSecretHosts: Set<String> = [
+        "com.apple.SecurityAgent",
+        "com.apple.SecurityAgent.helper",
+        "com.apple.UserNotificationCenter",
+        "com.apple.systempreferences",
+        "com.apple.tccd",
+        "com.apple.CoreServicesUIAgent",
+        "com.apple.loginwindow",
+        "com.apple.opendirectoryd",
+        "com.apple.controlcenter",
+    ]
+
+    /// Wording that marks a password/admin prompt, as opposed to a routine
+    /// confirmation that merely happens to contain a text field.
+    public static let authenticationWording = #"(?i)(password|passcode|administrator|administrator'?s name|authentication|authenticate|unlock|sign in|keychain|credential|sudo)"#
+
+    public static func isTrustedSecretDialog(bundleID: String?, text: String) -> Bool {
+        guard let bundleID, trustedSecretHosts.contains(bundleID) else { return false }
+        return text.range(of: authenticationWording, options: .regularExpression) != nil
+    }
 
     /// Windows owned by these processes are the system's own consent UI.
     public static let systemConsentHosts: Set<String> = [
@@ -142,7 +168,7 @@ public struct OwnerConsent: Equatable {
     /// The capability path's baseline list is deliberately not added here — it
     /// would silently re-refuse every authentication prompt the owner enabled.
     public func vetoPatterns(operatorPatterns: [String]) -> [String] {
-        var patterns = operatorPatterns + neverApprove
+        var patterns = operatorPatterns + neverApprove + [OwnerConsent.catastrophicBlock]
         if !allowAuthentication { patterns.append(OwnerConsent.authenticationBlock) }
         if !allowDestructive { patterns.append(OwnerConsent.destructiveBlock) }
         var seen = Set<String>()
