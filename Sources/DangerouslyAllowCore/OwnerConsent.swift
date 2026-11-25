@@ -27,7 +27,7 @@ public struct OwnerConsent: Equatable {
 
     /// Authentication wording. Applied only when the owner has not set
     /// `Allow_Authentication: true`; the fleet owner did.
-    public static let authenticationBlock = #"(?i)(password|passphrase|keychain|credential|secret|private[ -]?key|touch[ -]?id|filevault|apple[ -]?id|sudo|administrat(?:or|ion)|authenticate|authoriz|unlock|signing|system extension)"#
+    public static let authenticationBlock = #"(?i)(password|passphrase|keychain|credential|secret|private[ -]?key|touch[ -]?id|filevault|apple[ -]?(?:id|account)|\bsign[ -]?in\b|sudo|administrat(?:or|ion)|authenticate|authoriz|unlock|signing|system extension)"#
 
     /// Destructive maintenance (delete/format a volume or folder, overwrite,
     /// reboot). Lifted by `Allow_Destructive: true`.

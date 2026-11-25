@@ -218,6 +218,127 @@ final class OwnerConsentTests: XCTestCase {
         XCTAssertEqual(before.fingerprint, after.fingerprint)
     }
 
+    func testFieldValuesNeverReachDialogTextOrFullText() {
+        let secret = "STAR00715-secret"
+        let sheet = UINode(id: 1, role: "AXSheet", children: [
+            UINode(id: 2, role: "AXStaticText", text: "Enter your password."),
+            UINode(id: 3, role: "AXTextField", text: secret),
+            UINode(id: 4, role: "AXSecureTextField", text: secret),
+            UINode(id: 5, role: "AXButton", label: "Modify Settings"),
+            UINode(id: 6, role: "AXButton", label: "Cancel"),
+        ])
+        let root = UINode(id: 7, role: "AXWindow", children: [sheet])
+        guard case let .dialog(dialog)? = SystemDialogDetector.detectSheet(
+            root: root, policy: .always) else {
+            return XCTFail("sheet not detected")
+        }
+        XCTAssertFalse(dialog.dialogText.contains(secret))
+        XCTAssertFalse(dialog.fullText.contains(secret))
+        XCTAssertFalse(dialog.fingerprint.contains(secret))
+    }
+
+    func testPlainFieldAloneIsNeverAPasswordField() {
+        let sheet = UINode(id: 1, role: "AXSheet", children: [
+            UINode(id: 2, role: "AXStaticText", text: "Enter your password."),
+            UINode(id: 3, role: "AXTextField", text: "Roy Agiv"),
+            UINode(id: 4, role: "AXButton", label: "Modify Settings"),
+            UINode(id: 5, role: "AXButton", label: "Cancel"),
+        ])
+        let root = UINode(id: 6, role: "AXWindow", children: [sheet])
+        guard case let .dialog(dialog)? = SystemDialogDetector.detectSheet(
+            root: root, policy: .always) else {
+            return XCTFail("sheet not detected")
+        }
+        XCTAssertEqual(dialog.fields, [3])
+        XCTAssertNil(dialog.secureFields.first)
+        XCTAssertNil(dialog.passwordField)
+    }
+
+    func testCancelOnlySheetHasNoPressableTarget() {
+        let sheet = UINode(id: 1, role: "AXSheet", children: [
+            UINode(id: 2, role: "AXStaticText", text: "Enter your password."),
+            UINode(id: 3, role: "AXSecureTextField"),
+            UINode(id: 4, role: "AXButton", label: "Cancel"),
+        ])
+        let root = UINode(id: 5, role: "AXWindow", children: [sheet])
+        guard case let .dialog(dialog)? = SystemDialogDetector.detectSheet(
+            root: root, policy: .always) else {
+            return XCTFail("sheet detected for a diagnostic view")
+        }
+        XCTAssertNil(dialog.target, "Cancel must never be pressed")
+    }
+
+    func testOversizedOrButtonlessSheetsAreSkipped() {
+        let buttons = (0..<6).map { UINode(id: 10 + $0, role: "AXButton", label: "Option \($0)") }
+        let tooMany = UINode(id: 1, role: "AXSheet", children:
+            [UINode(id: 2, role: "AXSecureTextField")] + buttons)
+        XCTAssertNil(SystemDialogDetector.detectSheet(
+            root: UINode(id: 3, role: "AXWindow", children: [tooMany]), policy: .always))
+
+        let buttonless = UINode(id: 4, role: "AXSheet", children: [
+            UINode(id: 5, role: "AXStaticText", text: "Enter your password."),
+            UINode(id: 6, role: "AXSecureTextField"),
+        ])
+        XCTAssertNil(SystemDialogDetector.detectSheet(
+            root: UINode(id: 7, role: "AXWindow", children: [buttonless]), policy: .always))
+    }
+
+    func testMethodSwitchCoexistsWithTheGrantButton() {
+        let sheet = UINode(id: 1, role: "AXSheet", children: [
+            UINode(id: 2, role: "AXStaticText",
+                   text: "Touch ID or enter your password to continue."),
+            UINode(id: 3, role: "AXSecureTextField"),
+            UINode(id: 4, role: "AXButton", label: "Use Password…"),
+            UINode(id: 5, role: "AXButton", label: "Modify Settings"),
+            UINode(id: 6, role: "AXButton", label: "Cancel"),
+        ])
+        let root = UINode(id: 7, role: "AXWindow", children: [sheet])
+        guard case let .dialog(dialog)? = SystemDialogDetector.detectSheet(
+            root: root, policy: .always) else {
+            return XCTFail("sheet not detected")
+        }
+        XCTAssertEqual(dialog.passwordMethodOption?.label, "Use Password…")
+        XCTAssertEqual(dialog.target?.label, "Modify Settings",
+                       "the method switch must never replace the real grant button")
+    }
+
+    func testAChangedButtonLabelIsANewDialog() {
+        func sheet(grant: String, id: Int) -> UINode {
+            UINode(id: id, role: "AXSheet", children: [
+                UINode(id: id + 1, role: "AXStaticText", text: "Enter your password."),
+                UINode(id: id + 2, role: "AXSecureTextField"),
+                UINode(id: id + 3, role: "AXButton", label: grant),
+                UINode(id: id + 4, role: "AXButton", label: "Cancel"),
+            ])
+        }
+        guard case let .dialog(first)? = SystemDialogDetector.detectSheet(
+            root: UINode(id: 1, role: "AXWindow", children: [sheet(grant: "Modify Settings", id: 10)]),
+            policy: .always),
+              case let .dialog(second)? = SystemDialogDetector.detectSheet(
+            root: UINode(id: 1, role: "AXWindow", children: [sheet(grant: "OK", id: 20)]),
+            policy: .always) else {
+            return XCTFail("sheets not detected")
+        }
+        XCTAssertNotEqual(first.fingerprint, second.fingerprint,
+                          "a genuinely different dialog must not be suppressed")
+    }
+
+    func testAuditStoresNoPromptTextOrSecret() throws {
+        let auditDirectory = directory.appendingPathComponent("audit", isDirectory: true)
+        let audit = OwnerConsentAudit(directory: auditDirectory)
+        audit.record(
+            app: "System Settings", bundleID: "com.apple.systempreferences",
+            fingerprint: "Enter your password STAR00715-secret",
+            target: "Modify Settings", kind: "allowAlways", host: "test",
+            outcome: "pressed", passwordsUsed: true)
+        let file = auditDirectory.appendingPathComponent("consent-audit.jsonl")
+        let text = try String(contentsOf: file, encoding: .utf8)
+        XCTAssertFalse(text.contains("STAR00715"))
+        XCTAssertFalse(text.contains("Enter your password"))
+        XCTAssertTrue(text.contains("prompt_sha256"))
+        XCTAssertTrue(text.contains("\"passwords_used\":true"))
+    }
+
     func testPasswordsOnlyGoToSystemAuthenticationSurfaces() {
         XCTAssertTrue(OwnerConsent.isTrustedSecretDialog(
             bundleID: "com.apple.SecurityAgent",

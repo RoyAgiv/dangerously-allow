@@ -122,9 +122,7 @@ enum AXScanner {
         /// Authentication sheets answered lately, keyed by the surface and its
         /// buttons rather than by wording: a sheet that keeps reappearing is a
         /// failing credential, and pressing it forever cannot fix that.
-        private var authAttempts: [String: (count: Int, at: Date)] = [:]
-        private static let maxAuthAttempts = 3
-        private static let authAttemptWindow: TimeInterval = 120
+        private var authAttempts = AuthenticationAttempts()
         /// Windows already reported under --verbose, so a 2 Hz poll does not
         /// reprint the same unrecognised dialog forever.
         private var reported: Set<String> = []
@@ -140,6 +138,7 @@ enum AXScanner {
         /// anything.
         func pass() -> Bool {
             var seen: Set<String> = []
+            var seenAuth: Set<String> = []
             var pressed = false
             let started = Date()
             var scanned = 0
@@ -205,6 +204,9 @@ enum AXScanner {
                             continue
                         }
                         seen.insert(dialog.fingerprint)
+                        if dialog.passwordField != nil || dialog.passwordMethodOption != nil {
+                            seenAuth.insert(authKey(name, dialog))
+                        }
                         guard handled.insert(dialog.fingerprint).inserted else { continue }
                         if handle(dialog, appName: name, pid: app.processIdentifier) {
                             pressed = true
@@ -221,6 +223,7 @@ enum AXScanner {
                 }
             }
             handled.formIntersection(seen)
+            authAttempts.keepOnly(seenAuth)
             return pressed
         }
 
@@ -255,8 +258,8 @@ enum AXScanner {
             // that — once per second, indefinitely.
             let isAuthentication = dialog.passwordField != nil
                 || dialog.passwordMethodOption != nil
-            if isAuthentication, !authAttemptAllowed(appName, dialog) {
-                Log.warn("  authentication sheet returned \(Self.maxAuthAttempts) times — leaving for a human")
+            if isAuthentication, !authAttempts.allow(authKey(appName, dialog)) {
+                Log.warn("  authentication sheet returned \(authAttempts.limit) times — leaving for a human")
                 if opts.notify { Notify.post("Authentication in \(appName) needs the owner") }
                 opts.consentAudit?.record(
                     app: appName, bundleID: nil, fingerprint: dialog.fingerprint,
@@ -323,20 +326,12 @@ enum AXScanner {
             return false
         }
 
-        /// Count authentication presses per surface, not per wording: the
-        /// credential is the thing that failed, and only a human can supply a
-        /// different one. The window bounds a long-running watcher so a later,
-        /// legitimate prompt is not blocked by an old failure.
-        private func authAttemptAllowed(_ appName: String, _ dialog: DetectedSystemDialog) -> Bool {
-            let key = appName + "\u{a7}"
+        /// Stable identity of an authentication surface: the app plus its
+        /// buttons. Wording is deliberately excluded — it changes with field
+        /// values and error text, which would defeat the retry bound.
+        private func authKey(_ appName: String, _ dialog: DetectedSystemDialog) -> String {
+            appName + "\u{a7}"
                 + dialog.options.map(\.label).sorted().joined(separator: "|")
-            let now = Date()
-            var entry = authAttempts[key] ?? (count: 0, at: now)
-            if now.timeIntervalSince(entry.at) > Self.authAttemptWindow { entry.count = 0 }
-            entry.count += 1
-            entry.at = now
-            authAttempts[key] = entry
-            return entry.count <= Self.maxAuthAttempts
         }
 
         /// "Use Password…" on a Touch ID sheet. Pressing it grants nothing and
