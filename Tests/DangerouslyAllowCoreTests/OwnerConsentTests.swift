@@ -179,6 +179,17 @@ final class OwnerConsentTests: XCTestCase {
         XCTAssertEqual(dialog.target?.label, "Modify Settings")
     }
 
+    func testPasswordMethodWordingIsRecognisedButNotTheReverseSwitch() {
+        for label in ["Use Password…", "Use Password", "Use the Password…",
+                      "Enter Password", "Type Password…"] {
+            XCTAssertTrue(SystemDialogDetector.isPasswordMethod(label), label)
+        }
+        for label in ["Use Touch ID", "Use Touch ID…", "Cancel", "Modify Settings",
+                      "Change Password", "Use Password Manager"] {
+            XCTAssertFalse(SystemDialogDetector.isPasswordMethod(label), label)
+        }
+    }
+
     func testTouchIDSheetExposesThePasswordMethodSwitch() {
         let sheet = UINode(id: 1, role: "AXSheet", children: [
             UINode(id: 2, role: "AXStaticText",

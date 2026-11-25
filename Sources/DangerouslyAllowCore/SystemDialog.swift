@@ -155,7 +155,13 @@ public enum SystemDialogDetector {
     public static func isPasswordMethod(_ label: String) -> Bool {
         let lowered = OptionClassifier.foldApostrophes(label)
             .lowercased().trimmingCharacters(in: .whitespaces)
-        return passwordMethodPrefixes.contains { lowered.hasPrefix($0) }
+        for prefix in passwordMethodPrefixes where lowered.hasPrefix(prefix) {
+            // The switch is the whole label, possibly with an ellipsis. A
+            // longer label ("Use Password Manager…") is a different action.
+            let rest = lowered.dropFirst(prefix.count)
+            if rest.isEmpty || rest.allSatisfy({ "….:;· ".contains($0) }) { return true }
+        }
+        return false
     }
 
     /// True when the dialog wording matches a shipped permission sentence.
