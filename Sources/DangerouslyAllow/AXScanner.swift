@@ -119,6 +119,12 @@ enum AXScanner {
         /// A set rather than one slot: with several dialogs up at once, a
         /// single slot forgets the first as soon as the second is pressed.
         private var handled: Set<String> = []
+        /// Authentication sheets answered lately, keyed by the surface and its
+        /// buttons rather than by wording: a sheet that keeps reappearing is a
+        /// failing credential, and pressing it forever cannot fix that.
+        private var authAttempts: [String: (count: Int, at: Date)] = [:]
+        private static let maxAuthAttempts = 3
+        private static let authAttemptWindow: TimeInterval = 120
         /// Windows already reported under --verbose, so a 2 Hz poll does not
         /// reprint the same unrecognised dialog forever.
         private var reported: Set<String> = []
@@ -243,6 +249,32 @@ enum AXScanner {
                 }
             }
 
+            // An authentication sheet that keeps coming back means the press
+            // is not taking (wrong field, rejected credential, withheld
+            // secret). Retrying cannot help, and the old sweep did exactly
+            // that — once per second, indefinitely.
+            let isAuthentication = dialog.passwordField != nil
+                || dialog.passwordMethodOption != nil
+            if isAuthentication, !authAttemptAllowed(appName, dialog) {
+                Log.warn("  authentication sheet returned \(Self.maxAuthAttempts) times — leaving for a human")
+                if opts.notify { Notify.post("Authentication in \(appName) needs the owner") }
+                opts.consentAudit?.record(
+                    app: appName, bundleID: nil, fingerprint: dialog.fingerprint,
+                    target: dialog.target?.label ?? "", kind: "authentication", host: opts.host,
+                    outcome: "auth_retry_exhausted"
+                )
+                return false
+            }
+
+            // A Touch ID prompt carries no password field until its
+            // "Use Password…" switch is pressed. That press grants nothing; it
+            // only reveals the fields the next sweep fills.
+            if let method = dialog.passwordMethodOption {
+                return selectPasswordMethod(
+                    dialog, method: method, appName: appName, pid: pid
+                )
+            }
+
             guard let target = dialog.target else {
                 Log.warn("  nothing on it is acceptable under --policy \(opts.policy.rawValue) — leaving for a human")
                 if opts.notify { Notify.post("Permission dialog in \(appName) needs a human") }
@@ -289,6 +321,74 @@ enum AXScanner {
             }
             Log.error("  press failed (AXError \(err.rawValue))")
             return false
+        }
+
+        /// Count authentication presses per surface, not per wording: the
+        /// credential is the thing that failed, and only a human can supply a
+        /// different one. The window bounds a long-running watcher so a later,
+        /// legitimate prompt is not blocked by an old failure.
+        private func authAttemptAllowed(_ appName: String, _ dialog: DetectedSystemDialog) -> Bool {
+            let key = appName + "\u{a7}"
+                + dialog.options.map(\.label).sorted().joined(separator: "|")
+            let now = Date()
+            var entry = authAttempts[key] ?? (count: 0, at: now)
+            if now.timeIntervalSince(entry.at) > Self.authAttemptWindow { entry.count = 0 }
+            entry.count += 1
+            entry.at = now
+            authAttempts[key] = entry
+            return entry.count <= Self.maxAuthAttempts
+        }
+
+        /// "Use Password…" on a Touch ID sheet. Pressing it grants nothing and
+        /// dismisses nothing; it swaps the authentication method so the next
+        /// sweep can fill the secure fields. It is only worth pressing when a
+        /// secret is configured — otherwise the owner's own Touch ID prompt is
+        /// the better answer.
+        private func selectPasswordMethod(
+            _ dialog: DetectedSystemDialog,
+            method: SystemDialogOption,
+            appName: String,
+            pid: pid_t
+        ) -> Bool {
+            let bundleID = CodeSigningIdentityProbe().identity(forPID: pid)?.bundleID
+            guard let consent = opts.ownerConsent, consent.allowAuthentication,
+                  !consent.secretCommand.isEmpty
+            else {
+                Log.info("  password method offered; no owner secret to fill it — leaving for a human")
+                return false
+            }
+            guard OwnerConsent.isTrustedSecretDialog(bundleID: bundleID, text: dialog.fullText) else {
+                Log.warn("REFUSING — password method on an untrusted surface (\(bundleID ?? "unknown"))")
+                if opts.notify { Notify.post("Refused a password method on an untrusted surface") }
+                return false
+            }
+            if let blocked = PromptDetector.blockingPattern(
+                screen: dialog.fullText,
+                neverApprove: consent.vetoPatterns(operatorPatterns: opts.neverApprove)
+            ) {
+                Log.warn("REFUSING — password method matches --never-approve /\(blocked)/")
+                return false
+            }
+            Log.info("  -> pressing \"\(method.label)\" to reveal the password fields")
+            if opts.dryRun {
+                Log.info("  [dry-run] pressed nothing")
+                return false
+            }
+            guard let err = tree.press(method.id), err == .success else {
+                Log.error("  could not switch to password entry")
+                opts.consentAudit?.record(
+                    app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                    target: method.label, kind: "authentication", host: opts.host,
+                    outcome: "password_method_failed"
+                )
+                return false
+            }
+            opts.consentAudit?.record(
+                app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                target: method.label, kind: "authentication", host: opts.host,
+                outcome: "password_method_selected"
+            )
+            return true
         }
 
         /// Owner-consent path. The file is the authorization; the hard block
@@ -338,7 +438,11 @@ enum AXScanner {
             Log.info("  owner consent authorises this press (\(consent.path))")
             let audit = opts.consentAudit
             var passwordsUsed = false
-            if let field = dialog.fields.first {
+            // Only a secure entry field may receive the secret. An
+            // administrator sheet lists the account-name field first; typing
+            // there overwrites the name, the password stays empty, and the
+            // grant button can never succeed.
+            if let field = dialog.passwordField {
                 // A password field in an untrusted window is exactly the
                 // fabricated-dialog credential-theft shape. Never type into it
                 // and do not interact with the window at all.
@@ -354,18 +458,34 @@ enum AXScanner {
                     )
                     return false
                 }
-                if let secret = consent.resolveSecret() {
-                    if tree.typeInto(field, text: secret, pid: pid) {
-                        passwordsUsed = true
-                        Log.info("  filled the authentication field from the configured secret command")
-                    } else {
-                        Log.warn("  could not fill the authentication field; pressing anyway")
-                    }
-                } else if consent.secretCommand.isEmpty {
-                    Log.info("  password field present and no Secret_Command configured; pressing the grant button only")
-                } else {
-                    Log.warn("  Secret_Command produced no value; pressing the grant button only")
+                guard let secret = consent.resolveSecret() else {
+                    // Pressing a grant with an empty password can only fail,
+                    // and a failed authentication sheet stays up, so the next
+                    // sweep presses it again. Leave it for a human instead.
+                    Log.warn("  password field present but no secret resolved — not pressing the grant button")
+                    if opts.notify { Notify.post("Password in \(appName) needs the owner") }
+                    audit?.record(
+                        app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                        target: target.label, kind: target.kind.rawValue, host: opts.host,
+                        outcome: "password_unavailable"
+                    )
+                    return false
                 }
+                guard tree.typeInto(field, text: secret, pid: pid) else {
+                    Log.warn("  could not fill the password field — not pressing the grant button")
+                    audit?.record(
+                        app: appName, bundleID: bundleID, fingerprint: dialog.fingerprint,
+                        target: target.label, kind: target.kind.rawValue, host: opts.host,
+                        outcome: "password_fill_failed"
+                    )
+                    return false
+                }
+                passwordsUsed = true
+                Log.info("  filled the authentication field from the configured secret command")
+                // Let the sheet observe the value before the grant press.
+                usleep(150_000)
+            } else if !dialog.fields.isEmpty {
+                Log.warn("  authentication sheet has no secure field — not typing the secret into a plain field")
             }
             guard let err = tree.press(target.id) else {
                 Log.error("  lost the button between scan and press — leaving it")

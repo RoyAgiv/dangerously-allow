@@ -145,6 +145,79 @@ final class OwnerConsentTests: XCTestCase {
         XCTAssertEqual(dialog.target?.label, "Change Password")
     }
 
+    func testSecureSubroleIsNormalisedToASecureField() {
+        // AppKit's password field is AXTextField + subrole AXSecureTextField;
+        // without the subrole it is indistinguishable from the name field.
+        XCTAssertEqual(
+            NativeDialogSurface.normalizedRole(role: "AXTextField", subrole: "AXSecureTextField"),
+            "AXSecureTextField")
+        XCTAssertEqual(
+            NativeDialogSurface.normalizedRole(role: "AXTextField", subrole: "AXSearchField"),
+            "AXTextField")
+        XCTAssertEqual(
+            NativeDialogSurface.normalizedRole(role: "AXButton", subrole: "AXSecureTextField"),
+            "AXButton")
+    }
+
+    func testSecretGoesToTheSecureFieldNotTheAccountNameField() {
+        let name = UINode(id: 1, role: "AXTextField")
+        let password = UINode(id: 2, role: "AXSecureTextField")
+        let sheet = UINode(id: 3, role: "AXSheet", children: [
+            UINode(id: 4, role: "AXStaticText", text: "Enter your password to continue."),
+            name, password,
+            UINode(id: 5, role: "AXButton", label: "Modify Settings"),
+            UINode(id: 6, role: "AXButton", label: "Cancel"),
+        ])
+        let root = UINode(id: 7, role: "AXWindow", children: [sheet])
+        guard case let .dialog(dialog)? = SystemDialogDetector.detectSheet(
+            root: root, policy: .always) else {
+            return XCTFail("sheet not detected")
+        }
+        XCTAssertEqual(dialog.fields, [1, 2])
+        XCTAssertEqual(dialog.secureFields, [2])
+        XCTAssertEqual(dialog.passwordField, 2)
+        XCTAssertEqual(dialog.target?.label, "Modify Settings")
+    }
+
+    func testTouchIDSheetExposesThePasswordMethodSwitch() {
+        let sheet = UINode(id: 1, role: "AXSheet", children: [
+            UINode(id: 2, role: "AXStaticText",
+                   text: "Privacy & Security is trying to modify your system settings."),
+            UINode(id: 3, role: "AXStaticText",
+                   text: "Touch ID or enter your password to continue with Privacy & Security."),
+            UINode(id: 4, role: "AXButton", label: "Use Password…"),
+            UINode(id: 5, role: "AXButton", label: "Cancel"),
+        ])
+        let root = UINode(id: 6, role: "AXWindow", children: [sheet])
+        guard case let .dialog(dialog)? = SystemDialogDetector.detectSheet(
+            root: root, policy: .always) else {
+            return XCTFail("Touch ID sheet not detected")
+        }
+        XCTAssertEqual(dialog.passwordMethodOption?.label, "Use Password…")
+        XCTAssertNil(dialog.passwordField)
+        XCTAssertNil(dialog.target)
+    }
+
+    func testFieldValuesDoNotChangeTheFingerprint() {
+        func admin(username: String, id: Int) -> UINode {
+            let sheet = UINode(id: id, role: "AXSheet", children: [
+                UINode(id: id + 1, role: "AXStaticText", text: "Enter your password."),
+                UINode(id: id + 2, role: "AXTextField", text: username),
+                UINode(id: id + 3, role: "AXSecureTextField"),
+                UINode(id: id + 4, role: "AXButton", label: "Modify Settings"),
+                UINode(id: id + 5, role: "AXButton", label: "Cancel"),
+            ])
+            return UINode(id: id + 6, role: "AXWindow", children: [sheet])
+        }
+        guard case let .dialog(before)? = SystemDialogDetector.detectSheet(
+            root: admin(username: "Roy Agiv", id: 10), policy: .always),
+              case let .dialog(after)? = SystemDialogDetector.detectSheet(
+            root: admin(username: "STAR00715", id: 20), policy: .always) else {
+            return XCTFail("sheets not detected")
+        }
+        XCTAssertEqual(before.fingerprint, after.fingerprint)
+    }
+
     func testPasswordsOnlyGoToSystemAuthenticationSurfaces() {
         XCTAssertTrue(OwnerConsent.isTrustedSecretDialog(
             bundleID: "com.apple.SecurityAgent",

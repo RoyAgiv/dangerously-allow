@@ -19,6 +19,10 @@ public struct DetectedSystemDialog {
     /// Text fields on the dialog, in tree order. A password prompt carries one;
     /// a plain consent dialog carries none.
     public let fields: [Int]
+    /// The subset of `fields` that are secure entry fields, in tree order.
+    /// An administrator sheet offers an account-name field and then a password
+    /// field; only the secure one may receive a secret.
+    public let secureFields: [Int]
     /// The button the policy allows pressing. nil = this is a real permission
     /// dialog, but nothing on it is acceptable — leave it for a human.
     public let target: SystemDialogOption?
@@ -32,6 +36,7 @@ public struct DetectedSystemDialog {
     public init(
         options: [SystemDialogOption],
         fields: [Int] = [],
+        secureFields: [Int] = [],
         target: SystemDialogOption?,
         dialogText: String,
         fullText: String,
@@ -39,10 +44,24 @@ public struct DetectedSystemDialog {
     ) {
         self.options = options
         self.fields = fields
+        self.secureFields = secureFields
         self.target = target
         self.dialogText = dialogText
         self.fullText = fullText
         self.fingerprint = fingerprint
+    }
+
+    /// The one field a secret may be typed into: a secure entry field. A
+    /// dialog carrying only a plain field (an account name, a search box) must
+    /// never receive a password — that is how "STAR007…" ends up typed over
+    /// the administrator's name and the sheet can never be satisfied.
+    public var passwordField: Int? { secureFields.first }
+
+    /// A method switch such as "Use Password…" on a Touch ID sheet. It grants
+    /// nothing; it only reveals the password fields, so it is pressed as a
+    /// preparatory step and never treated as the dialog's grant button.
+    public var passwordMethodOption: SystemDialogOption? {
+        options.first { SystemDialogDetector.isPasswordMethod($0.label) }
     }
 }
 
@@ -124,6 +143,21 @@ public enum SystemDialogDetector {
         return .allowAlways
     }
 
+    /// Wording of the button that swaps a Touch ID prompt for a password sheet.
+    /// "Use Touch ID" is deliberately absent: it switches the other way.
+    static let passwordMethodPrefixes: [String] = [
+        "use password", "use the password", "enter password", "type password",
+    ]
+
+    /// True for a method switch such as "Use Password…". It only reveals the
+    /// fields of an authentication sheet, so it can be pressed before the
+    /// sheet has any text field at all — a Touch ID prompt carries none.
+    public static func isPasswordMethod(_ label: String) -> Bool {
+        let lowered = OptionClassifier.foldApostrophes(label)
+            .lowercased().trimmingCharacters(in: .whitespaces)
+        return passwordMethodPrefixes.contains { lowered.hasPrefix($0) }
+    }
+
     /// True when the dialog wording matches a shipped permission sentence.
     /// Used both by `--require-trigger` and by the containment gate, which
     /// refuses to press a native dialog whose wording it does not recognise.
@@ -145,7 +179,9 @@ public enum SystemDialogDetector {
         var buttons: [UINode] = []
         var texts: [String] = []
         var fields: [Int] = []
-        collect(root, buttons: &buttons, texts: &texts, fields: &fields)
+        var secureFields: [Int] = []
+        collect(root, buttons: &buttons, texts: &texts, fields: &fields,
+                secureFields: &secureFields)
 
         let labelled = buttons.filter { !$0.label.isEmpty }
         guard !labelled.isEmpty, labelled.count <= maxOptions else {
@@ -179,6 +215,7 @@ public enum SystemDialogDetector {
             DetectedSystemDialog(
                 options: options,
                 fields: fields,
+                secureFields: secureFields,
                 target: target,
                 dialogText: dialogText,
                 fullText: dialogText + " " + labels.joined(separator: " "),
@@ -203,39 +240,51 @@ public enum SystemDialogDetector {
                 var buttons: [UINode] = []
                 var texts: [String] = []
                 var fields: [Int] = []
-                collect(node, buttons: &buttons, texts: &texts, fields: &fields)
+                var secureFields: [Int] = []
+                collect(node, buttons: &buttons, texts: &texts, fields: &fields,
+                        secureFields: &secureFields)
                 let labelled = buttons.filter { !$0.label.isEmpty }
-                if !fields.isEmpty, !labelled.isEmpty, labelled.count <= maxOptions {
+                // A Touch ID prompt has no text field until its "Use Password…"
+                // switch is pressed, so a method switch alone qualifies.
+                let methodSheet = fields.isEmpty
+                    && labelled.contains { isPasswordMethod($0.label) }
+                if !fields.isEmpty || methodSheet, !labelled.isEmpty,
+                   labelled.count <= maxOptions {
                     let classified = labelled.map {
                         SystemDialogOption(id: $0.id, label: $0.label, kind: classify($0.label))
                     }
                     // Task-specific sheet buttons ("Change Password", "Unlock")
                     // classify as neutral; the last non-deny action is the
-                    // sheet's real primary button.
-                    let primary = classified.last { $0.kind != .deny } ?? classified.first
-                    if let primary {
+                    // sheet's real primary button. A method switch grants
+                    // nothing, so it never borrows the grant tier.
+                    var options = classified
+                    if !fields.isEmpty,
+                       let primary = classified.last(where: { $0.kind != .deny }) {
                         // A sheet's primary button is its grant action even when
                         // its wording is task-specific ("Change Password").
-                        let options = classified.map {
+                        options = classified.map {
                             $0.id == primary.id
                                 ? SystemDialogOption(id: $0.id, label: $0.label, kind: .allowAlways)
                                 : $0
                         }
-                        let dialogText = texts.joined(separator: " ")
-                        if !requireTrigger || hasRecognizedTrigger(dialogText)
-                            || dialogText.lowercased().contains("password") {
-                            let target = policy.preference.lazy
-                                .compactMap { kind in options.first(where: { $0.kind == kind }) }
-                                .first
-                            let labels = options.map(\.label)
-                            result = .dialog(DetectedSystemDialog(
-                                options: options, fields: fields, target: target,
-                                dialogText: dialogText,
-                                fullText: dialogText + " " + labels.joined(separator: " "),
-                                fingerprint: labels.joined(separator: "|") + "\u{a7}" + dialogText
-                            ))
-                            return
-                        }
+                    }
+                    let dialogText = texts.joined(separator: " ")
+                    let lowered = dialogText.lowercased()
+                    if !requireTrigger || hasRecognizedTrigger(dialogText)
+                        || lowered.contains("password")
+                        || (methodSheet && lowered.contains("touch id")) {
+                        let target = policy.preference.lazy
+                            .compactMap { kind in options.first(where: { $0.kind == kind }) }
+                            .first
+                        let labels = options.map(\.label)
+                        result = .dialog(DetectedSystemDialog(
+                            options: options, fields: fields, secureFields: secureFields,
+                            target: target,
+                            dialogText: dialogText,
+                            fullText: dialogText + " " + labels.joined(separator: " "),
+                            fingerprint: labels.joined(separator: "|") + "\u{a7}" + dialogText
+                        ))
+                        return
                     }
                 }
             }
@@ -248,7 +297,8 @@ public enum SystemDialogDetector {
     /// Buttons are leaves — their wording belongs to the option, not to the
     /// dialog, so `--never-approve` can tell the two apart.
     private static func collect(
-        _ node: UINode, buttons: inout [UINode], texts: inout [String], fields: inout [Int]
+        _ node: UINode, buttons: inout [UINode], texts: inout [String], fields: inout [Int],
+        secureFields: inout [Int]
     ) {
         // Original browser windows remain scan candidates after native dialog
         // discovery. A toolbar-free popup is still a web document, not a TCC
@@ -258,13 +308,19 @@ public enum SystemDialogDetector {
             buttons.append(node)
             return
         }
-        if node.role == "AXTextField" || node.role == "AXSecureTextField" {
+        let isField = node.role == "AXTextField" || node.role == "AXSecureTextField"
+        if isField {
             fields.append(node.id)
+            if node.role == "AXSecureTextField" { secureFields.append(node.id) }
         }
         if !node.label.isEmpty { texts.append(node.label) }
-        if !node.text.isEmpty { texts.append(node.text) }
+        // A field's value is user input, not dialog wording: typing a secret
+        // must not change the fingerprint, or the sweep reads the same sheet as
+        // a brand-new dialog and presses its grant button again — forever.
+        if !node.text.isEmpty, !isField { texts.append(node.text) }
         for child in node.children {
-            collect(child, buttons: &buttons, texts: &texts, fields: &fields)
+            collect(child, buttons: &buttons, texts: &texts, fields: &fields,
+                    secureFields: &secureFields)
         }
     }
 }

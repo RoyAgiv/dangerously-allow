@@ -10,4 +10,13 @@ public enum NativeDialogSurface {
     public static func shouldDescend(role: String) -> Bool {
         role != "AXWebArea"
     }
+
+    /// AppKit reports a secure entry field as `AXTextField` with subrole
+    /// `AXSecureTextField`. The subrole is the only thing that tells it apart
+    /// from the account-name field directly above it, so normalise it here —
+    /// without it every field looks alike and a secret goes to the first one.
+    public static func normalizedRole(role: String, subrole: String) -> String {
+        role == "AXTextField" && subrole == "AXSecureTextField"
+            ? "AXSecureTextField" : role
+    }
 }

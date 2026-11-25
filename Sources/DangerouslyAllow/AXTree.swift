@@ -184,7 +184,9 @@ final class AXTree {
         nextID += 1
         let id = nextID
 
-        let role = attribute(element, kAXRoleAttribute) as? String ?? ""
+        let rawRole = attribute(element, kAXRoleAttribute) as? String ?? ""
+        let subrole = attribute(element, kAXSubroleAttribute) as? String ?? ""
+        let role = NativeDialogSurface.normalizedRole(role: rawRole, subrole: subrole)
         let title = attribute(element, kAXTitleAttribute) as? String ?? ""
         let description = attribute(element, kAXDescriptionAttribute) as? String ?? ""
         let label = title.isEmpty ? description : title
