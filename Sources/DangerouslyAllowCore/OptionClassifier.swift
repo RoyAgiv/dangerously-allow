@@ -33,6 +33,10 @@ public enum OptionClassifier {
     ]
     static let allowFirstWords: Set<String> = [
         "yes", "y", "allow", "proceed", "ok", "okay", "continue", "approve", "accept",
+        // A signed helper's own owner-review sheet says "Authorize displayed
+        // operation". "Authorize" is an affirmative grant verb; without it the
+        // button is neutral and the sheet is left for a human.
+        "authorize", "authorise",
     ]
     /// Folder/workspace trust behind an affirmative — "Yes, I trust this folder" —
     /// outlives the process, so it is caught before the grant-tier phrases can

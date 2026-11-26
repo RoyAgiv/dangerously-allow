@@ -50,6 +50,10 @@ public struct OwnerConsent: Equatable {
         "com.apple.loginwindow",
         "com.apple.opendirectoryd",
         "com.apple.controlcenter",
+        // LocalAuthentication's password fallback (coreautha): the owner-presence
+        // sheet a signed helper gets from LAContext.evaluatePolicy. It is the
+        // system's own surface, so the configured secret may be typed into it.
+        "com.apple.LocalAuthentication.UIAgent",
     ]
 
     /// Wording that marks a password/admin prompt, as opposed to a routine

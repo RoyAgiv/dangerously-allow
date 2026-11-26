@@ -13,6 +13,12 @@ final class OptionClassifierTests: XCTestCase {
         XCTAssertEqual(OptionClassifier.classify("No, suggest changes (esc)"), .deny)
     }
 
+    func testOwnerReviewSheetAuthorizeLabelIsAGrant() {
+        // The signed Macs Connect desktop helper's owner-review sheet.
+        XCTAssertEqual(OptionClassifier.classify("Authorize displayed operation"), .allowOnce)
+        XCTAssertEqual(OptionClassifier.classify("Authorise displayed operation"), .allowOnce)
+    }
+
     func testClaudeCodeLabels() {
         XCTAssertEqual(OptionClassifier.classify("Yes"), .allowOnce)
         XCTAssertEqual(OptionClassifier.classify("Allow for this session (0 apps)"), .allowSession)

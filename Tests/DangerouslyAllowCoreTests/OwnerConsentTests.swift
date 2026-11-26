@@ -357,6 +357,11 @@ final class OwnerConsentTests: XCTestCase {
         XCTAssertTrue(OwnerConsent.isTrustedSecretDialog(
             bundleID: "com.apple.UserNotificationCenter",
             text: "Administrator authentication required"))
+        // LocalAuthentication's password fallback (coreautha) is the sheet a
+        // signed helper gets from LAContext.evaluatePolicy.
+        XCTAssertTrue(OwnerConsent.isTrustedSecretDialog(
+            bundleID: "com.apple.LocalAuthentication.UIAgent",
+            text: "Enter your password for this Mac."))
         // A fabricated dialog owned by an ordinary app is never filled.
         XCTAssertFalse(OwnerConsent.isTrustedSecretDialog(
             bundleID: "com.apple.osascript",
