@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import CryptoKit
 import DangerouslyAllowCore
 
 struct GuiWatchOptions {
@@ -119,6 +120,10 @@ enum AXScanner {
         /// A set rather than one slot: with several dialogs up at once, a
         /// single slot forgets the first as soon as the second is pressed.
         private var handled: Set<String> = []
+        /// Owner-review sheets whose blind Return did not dismiss them. A sheet
+        /// that survives once is a failing helper state; another Return cannot
+        /// fix it, so it is left for a human until the window disappears.
+        private var failedOwnerReview: Set<String> = []
         /// Authentication sheets answered lately, keyed by the surface and its
         /// buttons rather than by wording: a sheet that keeps reappearing is a
         /// failing credential, and pressing it forever cannot fix that.
@@ -154,6 +159,18 @@ enum AXScanner {
             for app in order {
                 scanned += 1
                 let name = app.localizedName ?? "pid:\(app.processIdentifier)"
+                // A signed helper that never ran AppKit's launch sequence owns a
+                // real WindowServer window that the AX API cannot read at all
+                // (AXError.cannotComplete). Its owner-review sheet is still a
+                // stock NSAlert whose default button is the approval, so the one
+                // narrow exception is an activate + Return, proved by the window
+                // disappearing. Anything readable takes the normal text-vetted path.
+                if pressUnreadableOwnerReviewIfNeeded(app, appName: name) {
+                    pressed = true
+                    lastAnswered = app.processIdentifier
+                    if opts.stopAfterFirst { return true }
+                    continue
+                }
                 // System Settings hosts inline authentication sheets inside a
                 // large window; its AX tree needs a longer, deeper read so the
                 // sheet is reached before the budget ends.
@@ -225,6 +242,161 @@ enum AXScanner {
             handled.formIntersection(seen)
             authAttempts.keepOnly(seenAuth)
             return pressed
+        }
+
+        /// The single signed executable whose owner-review sheet is approved by
+        /// its default button when AX cannot describe the window. Name alone is
+        /// never enough: the running process must carry the identical signing
+        /// certificate the fleet uses for that helper.
+        private static let ownerReviewExecutable = "MacsConnectDesktopHelper"
+        private static let ownerReviewCertificateSHA1 =
+            "52ac76dcab60c40eb1d591ba249a8a1d8a565cd8"
+
+        /// True when no other on-screen layer-0 window sits above this one.
+        private static func alertIsTopmost(at bounds: CGRect) -> Bool {
+            let list = CGWindowListCopyWindowInfo(
+                [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+            ) as? [[String: Any]] ?? []
+            let probe = CGPoint(x: bounds.midX, y: bounds.midY)
+            for window in list {
+                let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue ?? -1
+                guard layer == 0,
+                      let b = window[kCGWindowBounds as String] as? [String: Any],
+                      let x = b["X"] as? NSNumber, let y = b["Y"] as? NSNumber,
+                      let width = b["Width"] as? NSNumber, let height = b["Height"] as? NSNumber
+                else { continue }
+                let rect = CGRect(x: x.doubleValue, y: y.doubleValue,
+                                  width: width.doubleValue, height: height.doubleValue)
+                if rect.contains(probe) { return rect.equalTo(bounds) }
+            }
+            return false
+        }
+
+        /// On-screen layer-0 windows of one process. Returns nil when the process
+        /// has more than one large window: the review sheet is a single alert, and
+        /// an ambiguous set is not something a blind Return may answer.
+        private func ownerReviewWindow(pid: pid_t) -> CGRect? {
+            let list = CGWindowListCopyWindowInfo(
+                [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+            ) as? [[String: Any]] ?? []
+            var found: CGRect?
+            for window in list {
+                let windowPID = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value ?? -1
+                let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue ?? -1
+                let alpha = (window[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 0
+                guard windowPID == pid, layer == 0, alpha > 0,
+                      let bounds = window[kCGWindowBounds as String] as? [String: Any],
+                      let x = bounds["X"] as? NSNumber, let y = bounds["Y"] as? NSNumber,
+                      let width = bounds["Width"] as? NSNumber, let height = bounds["Height"] as? NSNumber,
+                      width.doubleValue >= 600, height.doubleValue >= 400
+                else { continue }
+                if found != nil { return nil }
+                found = CGRect(x: x.doubleValue, y: y.doubleValue,
+                               width: width.doubleValue, height: height.doubleValue)
+            }
+            return found
+        }
+
+        /// True only when the AX API cannot complete even the window list query.
+        /// A readable sheet must go through the normal detector so every veto
+        /// still applies.
+        private func axCannotReadWindows(pid: pid_t) -> Bool {
+            let app = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(app, 0.25)
+            var value: CFTypeRef?
+            let result = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value)
+            return result == .cannotComplete || result == .invalidUIElement
+        }
+
+        private func signedByOwnerReviewCertificate(pid: pid_t) -> Bool {
+            var code: SecCode?
+            let attributes = [kSecGuestAttributePid as String: pid] as CFDictionary
+            guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code) == errSecSuccess,
+                  let code
+            else { return false }
+            var information: CFDictionary?
+            guard SecCodeCopySigningInformation(
+                unsafeBitCast(code, to: SecStaticCode.self),
+                SecCSFlags(rawValue: kSecCSSigningInformation), &information
+            ) == errSecSuccess,
+                let dictionary = information as? [String: Any],
+                let certificates = dictionary[kSecCodeInfoCertificates as String] as? [SecCertificate],
+                let leaf = certificates.first
+            else { return false }
+            let der = SecCertificateCopyData(leaf) as Data
+            return Insecure.SHA1.hash(data: der)
+                .map { String(format: "%02x", $0) }.joined()
+                == Self.ownerReviewCertificateSHA1
+        }
+
+        /// Answers the owner-review sheet of the shipped helper when AX cannot
+        /// read it. The press is deliberately blind to wording, so it is bound to
+        /// the exact executable and signing certificate, requires the owner's
+        /// `Allow_Any_Dialog`, and is verified by the window disappearing.
+        private func pressUnreadableOwnerReviewIfNeeded(
+            _ app: NSRunningApplication, appName: String
+        ) -> Bool {
+            guard let consent = opts.ownerConsent, consent.allowAnyDialog,
+                  app.executableURL?.lastPathComponent == Self.ownerReviewExecutable
+            else { return false }
+            let pid = app.processIdentifier
+            guard let bounds = ownerReviewWindow(pid: pid),
+                  axCannotReadWindows(pid: pid),
+                  signedByOwnerReviewCertificate(pid: pid)
+            else { return false }
+            let fingerprint = "owner-review\u{a7}\(pid)\u{a7}"
+                + "\(Int(bounds.minX))x\(Int(bounds.minY))x\(Int(bounds.width))x\(Int(bounds.height))"
+            guard handled.insert(fingerprint).inserted,
+                  !failedOwnerReview.contains(fingerprint) else { return false }
+            Log.info("window of \(appName) — owner-review sheet AX cannot read "
+                + "(certificate-pinned, one large window)")
+            if opts.dryRun {
+                Log.info("  [dry-run] pressed nothing")
+                return false
+            }
+            // The helper never becomes NSWorkspace's frontmost application (it
+            // has no bundle), so Return cannot be aimed at it. NSAlert lays the
+            // grant button out at the horizontal centre of its content view,
+            // 64 points above the content's bottom edge; the WindowServer frame
+            // adds the alert's 75-point shadow on every side. Click that exact
+            // point only while this window is the topmost layer-0 window there.
+            guard Self.alertIsTopmost(at: bounds) else {
+                Log.warn("  owner-review sheet is covered — leaving it")
+                return false
+            }
+            let content = bounds.insetBy(dx: 75, dy: 75)
+            let target = CGPoint(x: content.midX, y: content.maxY - 64)
+            let source = CGEventSource(stateID: .hidSystemState)
+            CGEvent(mouseEventSource: source, mouseType: .leftMouseDown,
+                    mouseCursorPosition: target, mouseButton: .left)?
+                .post(tap: .cghidEventTap)
+            Thread.sleep(forTimeInterval: 0.06)
+            CGEvent(mouseEventSource: source, mouseType: .leftMouseUp,
+                    mouseCursorPosition: target, mouseButton: .left)?
+                .post(tap: .cghidEventTap)
+            let deadline = Date(timeIntervalSinceNow: 4)
+            while Date() < deadline {
+                if ownerReviewWindow(pid: pid) == nil {
+                    Log.info("  pressed \"default button\" under owner consent "
+                        + "(AX-unreadable owner-review sheet)")
+                    opts.consentAudit?.record(
+                        app: appName, bundleID: nil, fingerprint: fingerprint,
+                        target: "default button", kind: "allowAlways", host: opts.host,
+                        outcome: "pressed"
+                    )
+                    return true
+                }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            Log.warn("  owner-review sheet did not disappear after the click — leaving it")
+            failedOwnerReview.insert(fingerprint)
+            if opts.notify { Notify.post("Owner-review sheet in \(appName) needs a human") }
+            opts.consentAudit?.record(
+                app: appName, bundleID: nil, fingerprint: fingerprint,
+                target: "default button", kind: "allowAlways", host: opts.host,
+                outcome: "unreadable_owner_review_failed"
+            )
+            return false
         }
 
         /// Returns true when the dialog was confirmed.
