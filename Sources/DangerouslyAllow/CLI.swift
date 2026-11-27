@@ -63,6 +63,21 @@ CONTAINMENT (native permission dialogs and notification banners)
   --prompt-fingerprint <id>       prompt the check pretends to answer
   --target-label <label>          button the check pretends to press
 
+  CARD PRESS LEDGER  (in-app approval cards)
+  A card has no nonce, so a press is claimed by identity: host, signed app
+  identity, window identity and prompt fingerprint. The claim is durable, so a
+  re-presented card is refused as duplicate_card_press — from a second window,
+  another watcher process, or after a restart — for 24 hours.
+
+  --card-claim-check              claim one card presentation and print the
+                                  decision as JSON; presses nothing and does not
+                                  touch an Accessibility tree
+  --card-window <identity>        window identity the claim pretends to see
+  --card-prompt <fingerprint>     card fingerprint the claim pretends to see
+  --card-app <bundle-id>          app the claim is for (default: the named app)
+  --card-team <team-id>           team id the claim is for
+  --card-store <dir>              claim directory (default: Application Support)
+
   Task ids and session ids are correlators, never credentials: the signature,
   the pinned issuer fingerprint, the expiry and the one-use nonce are what
   authorise a press.
@@ -281,7 +296,12 @@ struct CLI {
         if containment.runCheck {
             containment.printCheckJSON(channel: containment.checkChannel)
         }
+        if containment.runCardClaimCheck {
+            containment.printCardClaimJSON(defaultBundleID: "", defaultTeamID: "")
+        }
         opts.gate = containment.makeGate(channel: .systemDialog)
+        opts.cardLedger = FileCardPressLedger(directory: containment.cardDirectory)
+        opts.host = containment.host
 
         signal(SIGINT) { _ in
             Log.plain("")
@@ -403,6 +423,9 @@ struct CLI {
         if containment.runCheck {
             containment.printCheckJSON(channel: containment.checkChannel)
         }
+        if containment.runCardClaimCheck {
+            containment.printCardClaimJSON(defaultBundleID: "", defaultTeamID: "")
+        }
         opts.gate = containment.makeGate(channel: .systemDialog)
 
         signal(SIGINT) { _ in
@@ -430,7 +453,7 @@ struct CLI {
         }
         var base = AppWatchOptions(appName: pinned.bundleID)
         base.pinnedApp = pinned
-        watchApp(base, Array(args.dropFirst()), containment: nil)
+        watchApp(base, Array(args.dropFirst()), containment: ContainmentOptions())
     }
 
     private static func runNotifications(_ args: [String]) {
@@ -484,6 +507,14 @@ struct CLI {
             if resolved.runCheck {
                 resolved.printCheckJSON(channel: resolved.checkChannel)
             }
+            if resolved.runCardClaimCheck {
+                resolved.printCardClaimJSON(
+                    defaultBundleID: opts.pinnedApp?.bundleID ?? "",
+                    defaultTeamID: opts.pinnedApp?.teamID ?? ""
+                )
+            }
+            opts.cardLedger = FileCardPressLedger(directory: resolved.cardDirectory)
+            opts.host = resolved.host
             if let channel = opts.nativeGuiChannel {
                 opts.gate = resolved.makeGate(channel: channel)
             }

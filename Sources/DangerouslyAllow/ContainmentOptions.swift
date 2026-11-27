@@ -10,7 +10,7 @@ struct ContainmentOptions {
     var trustedIssuerSHA256: [String] = []
     var taskID = ""
     var sessionID = ""
-    var host = ProcessInfo.processInfo.hostName
+    var host = HostEnvironment.resolvedHost()
     var replayDirectory = FileNativeGuiReplayLedger.defaultDirectory()
     var policy: AllowPolicy = .once
     var neverApprove: [String] = []
@@ -24,6 +24,15 @@ struct ContainmentOptions {
     var checkChannel: NativeGuiContainment.Channel = .systemDialog
     var checkPromptFingerprint = "containment-diagnostic"
     var checkTargetLabel = "Allow Once"
+    /// Card-press ledger diagnostics. `--card-claim-check` runs the same
+    /// `CardPressGuard` the watchers use and prints the decision; it presses
+    /// nothing and touches no Accessibility tree.
+    var runCardClaimCheck = false
+    var cardDirectory = FileCardPressLedger.defaultDirectory()
+    var cardWindowIdentity = ""
+    var cardPromptFingerprint = ""
+    var cardAppBundleID = ""
+    var cardAppTeamID = ""
 
     /// Read the environment once, before argv: an explicit flag still wins.
     static func fromEnvironment() -> ContainmentOptions {
@@ -79,6 +88,18 @@ struct ContainmentOptions {
             checkPromptFingerprint = value()
         case "--target-label":
             checkTargetLabel = value()
+        case "--card-claim-check":
+            runCardClaimCheck = true
+        case "--card-store":
+            cardDirectory = URL(fileURLWithPath: value())
+        case "--card-window":
+            cardWindowIdentity = value()
+        case "--card-prompt":
+            cardPromptFingerprint = value()
+        case "--card-app":
+            cardAppBundleID = value()
+        case "--card-team":
+            cardAppTeamID = value()
         default:
             return false
         }
@@ -202,6 +223,38 @@ struct ContainmentOptions {
         } else {
             printJSON(payload)
         }
+        exit(0)
+    }
+
+    /// Run one card-press claim through the executable's own guard and print
+    /// the decision. The watcher consults exactly this guard immediately before
+    /// `AXUIElementPerformAction`, so the second claim for a presentation is
+    /// the denial that would have stopped a second physical press.
+    func printCardClaimJSON(defaultBundleID: String, defaultTeamID: String) -> Never {
+        let identity = CardPressIdentity(
+            host: host,
+            appBundleID: cardAppBundleID.isEmpty ? defaultBundleID : cardAppBundleID,
+            appTeamID: cardAppTeamID.isEmpty ? defaultTeamID : cardAppTeamID,
+            windowIdentity: cardWindowIdentity,
+            promptFingerprint: cardPromptFingerprint.isEmpty
+                ? checkPromptFingerprint : cardPromptFingerprint
+        )
+        let decision = CardPressGuard.claim(
+            identity, ledger: FileCardPressLedger(directory: cardDirectory)
+        )
+        let payload: [String: Any] = [
+            "Claimed": decision.isAuthorized,
+            "Reason": decision.reason,
+            "Host": identity.host,
+            "App_Bundle_Id": identity.appBundleID,
+            "App_Team_Id": identity.appTeamID,
+            "Window_Identity": identity.windowIdentity,
+            "Prompt_Fingerprint": identity.promptFingerprint,
+            "Ledger_Key": identity.ledgerKey,
+            "Retention_Seconds": Int(CardPressGuard.defaultRetention),
+            "Ledger_Directory": cardDirectory.path,
+        ]
+        printJSON(payload)
         exit(0)
     }
 }

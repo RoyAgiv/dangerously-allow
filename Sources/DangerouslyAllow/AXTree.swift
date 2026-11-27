@@ -125,6 +125,24 @@ final class AXTree {
             ? value : nil
     }
 
+    /// Stable-as-the-window identity material for the card-press ledger.
+    ///
+    /// AX element ids and pointers do not survive a rescan, so they cannot be
+    /// what "the same card" means. A window's AXIdentifier does survive for its
+    /// lifetime; when an app does not publish one, its role and title are the
+    /// best identity available, and the window's position in the app's ordered
+    /// window list is the last resort. Over-identifying is safe here (it can
+    /// only suppress a press), under-identifying is not, so the fallback never
+    /// merges two untitled windows.
+    func windowIdentity(_ element: AXUIElement, index: Int) -> String {
+        let identifier = attribute(element, kAXIdentifierAttribute) as? String ?? ""
+        if !identifier.isEmpty { return "ax-id:\(identifier)" }
+        let role = attribute(element, kAXRoleAttribute) as? String ?? "AXWindow"
+        let title = attribute(element, kAXTitleAttribute) as? String ?? ""
+        if !title.isEmpty { return "ax-role:\(role)|ax-title:\(title)" }
+        return "ax-role:\(role)|ordinal:\(index)"
+    }
+
     func windows(ofPID pid: pid_t) -> [AXUIElement] {
         let app = AXUIElementCreateApplication(pid)
         let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? ""

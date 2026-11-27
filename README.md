@@ -45,9 +45,16 @@ make uninstall
 secondary terminal-agent mode (`brew install tmux`).
 
 ```bash
-make check                # 152 unit tests + 12 tmux end-to-end + 22 containment
+make check                # 182 unit tests + 12 tmux end-to-end + 45 containment
 make help                 # list targets
 ```
+
+`swift test` needs the XCTest module, which Command Line Tools alone does not
+ship. No fleet host has Xcode (verified 2026-11-23 on M4, M1 Mini, M1 Pro, M6-1
+and M6-2: each has only `/Library/Developer/CommandLineTools` and no
+`/Applications/Xcode*.app`). Unit tests therefore run through the local XCTest
+shim; `make containment` and `make integration` run the real binary and are the
+accepted end-to-end route.
 
 Grant your terminal Accessibility permission (System Settings → Privacy &
 Security → Accessibility). That is the only setup, and it replaces the `sudo`
@@ -201,7 +208,7 @@ the same shape macs-connect already uses for owner grants:
   "Payload": {
     "Domain": "dangerously-allow-native-gui-action/v1",
     "Purpose": "native-gui-approve",
-    "Host": "hyde-m6-2.local",
+    "Host": "hyde-m6-2",
     "Task_Id": "…", "Session_Id": "…", "Request_Id": "…",
     "App_Bundle_Id": "com.openai.codex",
     "App_Team_Id": "2DC432GLL2",
@@ -230,31 +237,69 @@ compared to narrow what a signature may authorise, and a capability with the
 right task but no valid signature authorises nothing. No task id, session id,
 environment variable or CLI flag makes the channel click-capable on its own.
 
-### There is no issuer yet
+`Host` defaults to the machine's **stable local name**, not
+`ProcessInfo.hostName`: the first DNS label, lowercased, so `hyde-m6-2.local`,
+`hyde-m6-2.tail6f7ef3.ts.net` and `hyde-m6-2` are one identity. The resolver
+prefers `SCDynamicStoreCopyLocalHostName`, then the computer name, then the BSD
+hostname, and requires a DNS-label-shaped result; if none is usable the host is
+empty and both the capability gate and the card ledger refuse. An explicit
+`--host` wins verbatim and must match the issuer's value.
+
+### There is no issuer, and none was added
 
 macs-connect has no authenticated path that mints an application-action
-capability. Its request receipts (including PR #1595) are integrity-hashed
-*provenance evidence*, not signed authorisations, and its closest signed
-contract — `Check_Runtime_Upgrade_Grant`'s ES256-DER owner grant — is bound to a
-runtime-upgrade plan and issued offline by the owner. So click-capable native
-GUI stays fail-closed: in this build `--policy always` observes, and a valid
-capability can only be produced by an out-of-band issuer the operator trusts
-explicitly.
+capability, and this change deliberately did not invent one. The concrete
+findings, from the real gateway source:
 
-What a real issuer must provide, before this channel can press anything:
+* its MCP/HTTP gateway has no caller identity at all; `Task_Id` and `Session_Id`
+  arrive in the request, so treating either as authorisation would be exactly
+  the bypass the capability exists to prevent;
+* its request receipts are integrity-hashed *provenance evidence*, not signed
+  authorisations;
+* its one signed contract on this path, `Check_Runtime_Upgrade_Grant`, is a
+  verification-only ES256-DER owner grant bound to a runtime-upgrade plan and
+  issued offline — there is no issuer endpoint;
+* its M4 scoped signer is purpose-locked: the policy schema is
+  `hyde-m4-signing-policy/v1`, the purpose is `macs-connect-desktop-helper`, and
+  its key is the M4 first-enrollment issuer key. Borrowing it for
+  `dangerously-allow-native-gui-action/v1` would cross both a purpose and a
+  domain boundary, and no purpose-scoped key or derivation for native-GUI
+  approval exists anywhere in the fleet.
 
-* an owner-authenticated gateway operation (a tool, not a new daemon) that
-  accepts a task-bound request and returns this envelope;
-* the payload above with a ≤120 s lifetime and a fresh 32-byte nonce;
-* signature by an enrolled key whose SPKI SHA-256 is published to the executing
-  host's trust set;
-* a durable one-use nonce record shared with the executor (or a ledger the
-  executor can atomically claim);
-* the pinned app identity and the exact prompt fingerprint the supervisor
-  observed.
+So click-capable native GUI stays fail-closed: in this build `--policy always`
+observes, and `--trusted-issuer` defaults to empty. A capability can only be
+produced by an out-of-band issuer the operator trusts explicitly.
 
-Until that exists, the honest claim is containment, not approval: this
-executable never presses a native permission dialog.
+#### The exact owner authorization required
+
+Before this channel can press anything, the owner must approve all five, in
+this order:
+
+1. **A dedicated key, never the existing ones.** A new non-exportable P-256
+   Secure Enclave key on each executing host, under its own key tag/namespace
+   (for example `com.hyde.macs-connect.native-gui-approve.v1`), with
+   `.userPresence` access control so every signature requires a real Touch ID
+   confirmation. It must not be the RPG grant/backup key and must not be the M4
+   scoped signer's first-enrollment key.
+2. **A typed native signing operation.** A new action in the *signed* desktop
+   helper — not a new daemon — that accepts only the closed payload field set,
+   fixes `Domain` and `Purpose` itself, and refuses a caller-supplied domain.
+   Shipping it requires an owner-approved signed helper release and an explicit
+   enrollment record (host, purpose, public-key SPKI SHA-256) in gateway config.
+3. **Explicit trust on the executor.** The owner publishes only that public-key
+   SPKI SHA-256 into the executing host's trust set
+   (`--trusted-issuer` / `DANGEROUSLY_ALLOW_TRUSTED_ISSUERS`). The private key
+   never leaves the Secure Enclave.
+4. **An attested observation, not a caller claim.** The request must carry the
+   pinned app identity, the exact prompt fingerprint and a fresh 32-byte nonce
+   that came from an authenticated supervisor observation of the live window.
+   The issuer must refuse a request whose only authority is a task or session
+   id.
+5. **Owner acceptance evidence.** Two consecutive evaluations with the same
+   capability must yield exactly one press, a re-presented card must yield
+   `duplicate_card_press`, and an unauthenticated caller must be refused with no
+   capability produced. Until all five hold, the correct state is this one:
+   observe-only.
 
 `--containment-status` prints the resolved configuration and the reasons it is
 observe-only. `--containment-check` runs one full evaluation against an
@@ -361,6 +406,45 @@ nothing to press and is never touched. Both need the terminal to have
 Accessibility permission (System Settings → Privacy & Security →
 Accessibility); neither needs sudo. If a card's wording is not recognised, run
 with `--dump` to print the pruned AX tree and paste it into an issue.
+
+### One physical press per card
+
+A card has no nonce, so operation-level dedup is not enough. A04 showed the
+gap directly: two presentations of the same approval card produced two physical
+presses while the operation deduplicated once. The in-memory "already handled"
+set only covers a card while it is still on screen; a redraw, a second window,
+another watcher process or a restart all used to look like a new card.
+
+Every card press now takes a durable claim first, keyed on:
+
+* the host the watcher runs on, canonicalised to its stable first DNS label so
+  `*.local`, tailnet and single-label spellings of one machine are one
+  identity,
+* the app's live signed identity (bundle id and team id),
+* a window identity that survives rescans of the same window
+  (`AXIdentifier`, else role + title, else the window's ordinal), and
+* the card's prompt fingerprint (option labels plus card text).
+
+A04's follow-up found the default host spelling was itself unstable:
+`ProcessInfo.hostName` returned `hyde-m6-2`, `hyde-m6-2.local` and
+`hyde-m6-2.tail6f7ef3.ts.net` on one machine. The ledger therefore keys on the
+canonical first DNS label of the stable local name, so a `.local` or tailnet
+name change cannot re-key a card; an explicit `--host` still wins verbatim.
+
+One claim is one physical press. A re-presented identical card is refused with
+`duplicate_card_press` — a distinct code — and left for a human. A genuinely new
+card (different wording, command, window, app or host) is still claimed and
+pressed. The claim is written with `O_CREAT|O_EXCL`, so concurrent watchers race
+and exactly one wins; it is retained for 24 hours in
+`~/Library/Application Support/dangerously-allow/card-press-ledger` (bounded to
+4096 live records, override with `--card-store`). The claim is spent
+immediately before `AXUIElementPerformAction`, so a veto, a dry run or a card
+with no acceptable option never burns it.
+
+`--card-claim-check --card-window <id> --card-prompt <fingerprint>` runs that
+same guard and prints the decision without touching an Accessibility tree or
+pressing anything; `tools/containment-test.sh` uses it to prove one-winner
+semantics across eight concurrent processes.
 
 ## Sweeping without stalling
 
@@ -521,6 +605,8 @@ Sources/DangerouslyAllowCore/    pure logic, no I/O — where the tests live
   SystemDialog.swift             native macOS permission dialogs
   DesktopRouter.swift            which detector owns a window; the watched apps
   NativeGuiContainment.swift     pinned identities, capability gate, one-use ledger
+  CardPressLedger.swift          one-shot card identity claims (press-level dedup)
+  HostIdentity.swift             canonical host labels; one identity per machine
 Sources/DangerouslyAllow/
   AXTree.swift                   the only file that touches AXUIElement
   DesktopWatcher.swift           the default mode: all three channels, one loop
@@ -528,6 +614,8 @@ Sources/DangerouslyAllow/
   AXScanner.swift                `gui`: every app's AX tree -> SystemDialog
   NativeGuiGate.swift            code-signature probe, capability loading, ledger
   ContainmentOptions.swift       containment flags, status and check output
+  CardPressStore.swift           durable `O_CREAT|O_EXCL` card claim ledger
+  HostEnvironment.swift          stable local host resolution (not reverse DNS)
   TmuxChannel.swift              capture-pane / send-keys
   Watcher.swift                  closed-loop poll -> navigate -> confirm
   Runner.swift                   `run`: start the agent in tmux, spawn the watcher
@@ -551,8 +639,11 @@ and paste the parsed menu into an issue along with the raw
 `tmux capture-pane -p -t <session>` output. New harnesses are usually just a few
 labels in `OptionClassifier` plus a fixture in `RealCaptureTests`.
 
-`make check` must stay green: 120 unit tests, and 12 end-to-end tests that drive a
-mock TUI through a real tmux pane.
+`make check` must stay green: 182 unit tests (run through the local XCTest shim
+on the CLT-only fleet), 12 end-to-end tests that drive a mock TUI through a real
+tmux pane, and 45 executable-level containment checks. Until a host with Xcode
+exists, `swift test` itself cannot resolve XCTest and is expected to fail; that
+limitation is a test-host fact, not a product failure.
 
 ## License
 

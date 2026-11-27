@@ -26,6 +26,12 @@ struct AppWatchOptions {
     /// which cannot attest the banner's poster and therefore declines.
     var nativeGuiChannel: NativeGuiContainment.Channel?
     var gate: NativeGuiGate?
+    /// Durable one-shot claim on a card presentation, so a re-presented
+    /// identical card is never pressed twice — across windows, watcher
+    /// processes and restarts. Nil only in tests that build options directly.
+    var cardLedger: CardPressClaimRecording?
+    /// Host the claim is bound to; part of the card identity.
+    var host = HostEnvironment.resolvedHost()
     var probe: AppIdentityProbing = CodeSigningIdentityProbe()
 }
 
@@ -68,6 +74,10 @@ final class AppWatcher {
         if let channel = opts.nativeGuiChannel {
             Log.info("native channel: \(channel.rawValue) — \(opts.gate?.summary ?? "observe-only")")
         }
+        if opts.cardLedger != nil, opts.nativeGuiChannel == nil {
+            Log.info("card press ledger: one press per card identity for "
+                + "\(Int(CardPressGuard.defaultRetention / 3600))h")
+        }
         if !opts.neverApprove.isEmpty {
             Log.info("never-approve: \(opts.neverApprove.joined(separator: ", "))")
         }
@@ -100,11 +110,11 @@ final class AppWatcher {
         var seen: Set<String> = []
         var pressed = false
         for app in apps {
+            let liveIdentity = opts.dump ? nil : opts.probe.identity(forPID: app.processIdentifier)
             if let pinned = opts.pinnedApp, !opts.dump {
-                let identity = opts.probe.identity(forPID: app.processIdentifier)
-                guard identity?.bundleID == pinned.bundleID,
-                      identity?.teamID == pinned.teamID,
-                      identity?.satisfiesPinnedRequirement == true
+                guard liveIdentity?.bundleID == pinned.bundleID,
+                      liveIdentity?.teamID == pinned.teamID,
+                      liveIdentity?.satisfiesPinnedRequirement == true
                 else {
                     if !warnedUnverified {
                         Log.warn("refusing '\(app.localizedName ?? opts.appName)': its live "
@@ -115,7 +125,10 @@ final class AppWatcher {
                 }
                 warnedUnverified = false
             }
-            for window in tree.windows(ofPID: app.processIdentifier) {
+            let appBundleID = opts.pinnedApp?.bundleID
+                ?? liveIdentity?.bundleID ?? app.bundleIdentifier ?? ""
+            let appTeamID = liveIdentity?.teamID ?? ""
+            for (index, window) in tree.windows(ofPID: app.processIdentifier).enumerated() {
                 guard let root = tree.build(window, within: 1.5) else { continue }
                 if opts.dump {
                     Log.info("window of \(app.localizedName ?? "?"):")
@@ -126,7 +139,10 @@ final class AppWatcher {
                 seen.insert(prompt.fingerprint)
                 guard handled.insert(prompt.fingerprint).inserted else { continue }
                 if handle(prompt, appName: app.localizedName ?? opts.appName,
-                          pid: app.processIdentifier) {
+                          pid: app.processIdentifier,
+                          windowIdentity: tree.windowIdentity(window, index: index),
+                          appBundleID: appBundleID,
+                          appTeamID: appTeamID) {
                     pressed = true
                     if opts.stopAfterFirst { return true }
                 }
@@ -161,7 +177,14 @@ final class AppWatcher {
     }
 
     /// Returns true when the card was confirmed.
-    private func handle(_ prompt: DetectedButtonPrompt, appName: String, pid: pid_t) -> Bool {
+    private func handle(
+        _ prompt: DetectedButtonPrompt,
+        appName: String,
+        pid: pid_t,
+        windowIdentity: String,
+        appBundleID: String,
+        appTeamID: String
+    ) -> Bool {
         if let blocked = PromptDetector.blockingPattern(
             screen: prompt.fullText,
             neverApprove: NativeGuiContainment.effectiveNeverApprove(opts.neverApprove)
@@ -190,6 +213,35 @@ final class AppWatcher {
         if opts.dryRun {
             Log.info("  [dry-run] pressed nothing")
             return false
+        }
+
+        // Press-level dedup. The in-memory `handled` set only covers a card that
+        // is still on screen; this claim covers a re-presentation of the same
+        // card from another window, another watcher process, or after a restart.
+        // It is spent only here, immediately before a real press, so a veto, a
+        // missing target or a dry run never burns it.
+        if let ledger = opts.cardLedger, opts.nativeGuiChannel == nil {
+            let identity = CardPressIdentity(
+                host: opts.host,
+                appBundleID: appBundleID,
+                appTeamID: appTeamID,
+                windowIdentity: windowIdentity,
+                promptFingerprint: prompt.fingerprint
+            )
+            switch CardPressGuard.claim(identity, ledger: ledger) {
+            case let .press(claimed):
+                Log.info("  card claim \(claimed.ledgerKey.prefix(12))… is the first "
+                    + "for this presentation")
+            case .duplicate:
+                Log.warn("  observe-only — duplicate_card_press: this card was already "
+                    + "claimed (same host, app, window and prompt); leaving it for a human")
+                if opts.notify { Notify.post("Duplicate card in \(appName) left for a human") }
+                return false
+            case let .refused(refusal):
+                Log.warn("  observe-only — card press refused (\(refusal.rawValue))")
+                if opts.notify { Notify.post("Card in \(appName) left for a human") }
+                return false
+            }
         }
 
         // Notification banners are a native channel: the poster is not
